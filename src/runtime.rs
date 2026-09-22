@@ -11,7 +11,7 @@ use tokio::{task::JoinSet, time::Instant};
 use crate::{
     app::{self, Action},
     cli::Cli,
-    collector, compare, demo, event,
+    collector, commands, compare, demo, event,
     model::Snapshot,
     report,
     store::{Incident, IncidentSummary, SnapshotSummary, Store},
@@ -22,12 +22,13 @@ enum Work {
     Collected(Result<Snapshot>),
     History(u64, Result<Vec<SnapshotSummary>>),
     Saved(Result<(i64, Option<i64>)>),
-    Loaded(u64, Result<Snapshot>),
+    Loaded(u64, Result<(Snapshot, SnapshotSummary)>),
     Compared(u64, Result<String>),
     Incidents(u64, Result<Vec<IncidentSummary>>),
     SelectedIncident(u64, Result<Incident>),
     UpdatedIncident(u64, i64, Result<Incident>),
     Changed(u64, Result<Change>),
+    Exported(i64, bool, PathBuf, Result<()>),
 }
 
 struct Change {
@@ -120,6 +121,22 @@ async fn change(path: PathBuf, action: Action) -> Result<Change> {
     })
 }
 
+async fn load_capture(store: &Store, id: i64) -> Result<(Snapshot, SnapshotSummary)> {
+    let snapshot = store.load(id).await?;
+    let metadata = store.capture_metadata(id).await?;
+    let summary = SnapshotSummary {
+        id,
+        label: metadata.label,
+        captured_at: snapshot.completed_at,
+        source: format!(
+            "{} / {}",
+            snapshot.source.endpoint, snapshot.source.database
+        ),
+        complete: snapshot.is_complete(),
+    };
+    Ok((snapshot, summary))
+}
+
 pub(crate) async fn run(cli: &Cli) -> Result<()> {
     let collector = collector(cli).await?;
     let path = cli.store_path()?;
@@ -156,6 +173,13 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
     refresh_incidents(&mut work, &path, None, &mut requests);
 
     while !app.should_quit() {
+        let size = terminal
+            .terminal
+            .size()
+            .context("could not read terminal size")?;
+        app.viewport_width = size.width;
+        app.viewport_height = size.height;
+        app.clamp_scroll();
         terminal
             .terminal
             .draw(|frame| ui::render(frame, &app))
@@ -182,16 +206,17 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                             }
                         }
                         Action::Load(id) => {
+                            if app.tab == app::Tab::Incidents && app.incident_timeline { app.pending_capture_request = Some(view_generation); }
                             let path = path.clone();
-                            work.spawn(async move { Work::Loaded(view_generation, async { Store::open(&path).await?.load(id).await }.await) });
+                            work.spawn(async move { Work::Loaded(view_generation, async { load_capture(&Store::open(&path).await?, id).await }.await) });
                         }
                         Action::Compare(before, after) => {
                             let path = path.clone();
                             work.spawn(async move { Work::Compared(view_generation, async {
                                 let store = Store::open(&path).await?;
-                                let before = store.load(before).await?;
-                                let after = store.load(after).await?;
-                                Ok(report::comparison_markdown(&compare::compare(&before, &after)))
+                                let (before, before_capture) = load_capture(&store, before).await?;
+                                let (after, after_capture) = load_capture(&store, after).await?;
+                                Ok(report::comparison_with_captures_markdown(&compare::compare(&before, &after), &before_capture, &after_capture))
                             }.await) });
                         }
                         Action::ListHistory => refresh_history(&mut work, &path, &mut requests),
@@ -203,6 +228,15 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                         Action::CreateIncident(_) | Action::NoteIncident(_, _) | Action::CloseIncident(_, _) | Action::AttachCapture(_, _) | Action::LabelCapture(_, _) => {
                             let path = path.clone();
                             work.spawn(async move { Work::Changed(view_generation, change(path, action).await) });
+                        }
+                        Action::ExportIncident(id, json, destination) => {
+                            let path = path.clone();
+                            let destination = PathBuf::from(destination);
+                            app.set_notice(format!("Exporting incident #{id} to {}…", destination.display()));
+                            work.spawn(async move {
+                                let result = commands::export_incident(&path, id, json, &destination).await;
+                                Work::Exported(id, json, destination, result)
+                            });
                         }
                         Action::ResumeLive => {
                             if let Some(snapshot) = &last_live { app.set_snapshot(snapshot.clone(), false); }
@@ -267,7 +301,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                     Some(Ok(Work::UpdatedIncident(request, id, result))) if request == requests.detail => {
                         if app.incident.as_ref().is_some_and(|v| v.summary.id == id) {
                             match result {
-                                Ok(incident) => { app.incident = Some(incident); }
+                                Ok(incident) => app.update_incident(incident),
                                 Err(error) => app.set_notice(format!("Incident details unavailable: {error}")),
                             }
                         }
@@ -296,15 +330,28 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                             Err(error) => app.set_notice(format!("Could not save capture: {error}")),
                         }
                     }
+                    Some(Ok(Work::Exported(id, json, destination, result))) => {
+                        // Exports are durable actions, not view requests: their receipt must
+                        // survive navigation and must never activate a stale incident.
+                        app.set_notice(match result {
+                            Ok(()) => format!("Exported incident #{id} as {} to {}", if json { "JSON" } else { "Markdown" }, destination.display()),
+                            Err(error) => format!("Export failed for incident #{id}: {error}"),
+                        });
+                    }
                     Some(Ok(Work::Loaded(generation, result))) if generation == view_generation => match result {
-                        Ok(snapshot) => app.set_snapshot(snapshot, true),
-                        Err(error) => app.set_notice(format!("Could not load capture: {error}")),
+                        Ok((snapshot, capture)) => {
+                            app.pending_capture_request = None;
+                            app.set_snapshot(snapshot, true);
+                            app.capture = Some(capture);
+                        },
+                        Err(error) => { app.discard_pending_capture_return(generation); app.set_notice(format!("Could not load capture: {error}")); },
                     },
                     Some(Ok(Work::Compared(generation, result))) if generation == view_generation => match result {
                         Ok(report) => app.set_report(report),
                         Err(error) => app.set_notice(format!("Could not compare captures: {error}")),
                     },
-                    Some(Ok(Work::Loaded(_, _) | Work::Compared(_, _) | Work::SelectedIncident(_, _) | Work::History(_, _) | Work::Incidents(_, _) | Work::UpdatedIncident(_, _, _))) => {}
+                    Some(Ok(Work::Loaded(generation, _))) => app.discard_pending_capture_return(generation),
+                    Some(Ok(Work::Compared(_, _) | Work::SelectedIncident(_, _) | Work::History(_, _) | Work::Incidents(_, _) | Work::UpdatedIncident(_, _, _))) => {}
                     Some(Err(_)) => {
                         refreshing = false;
                         saving = false;
@@ -341,4 +388,59 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
     work.abort_all();
     // Dropping the terminal guard restores the shell even while network work is pending.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn offline_capture_load_retains_current_label_and_rejects_missing_payload() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(&temp.path().join("history.sqlite3")).await?;
+        let snapshot = demo::snapshot(0, false);
+        let id = store.save(&snapshot, "before adjustment").await?;
+        store
+            .annotate_capture(id, Some("renamed baseline"), None)
+            .await?;
+        let (loaded, summary) = load_capture(&store, id).await?;
+        assert_eq!(summary.id, id);
+        assert_eq!(summary.label, "renamed baseline");
+        assert_eq!(summary.captured_at, loaded.completed_at);
+        assert_eq!(loaded.source, snapshot.source);
+        assert!(load_capture(&store, id + 1).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn asynchronous_incident_refresh_preserves_displayed_id_in_response() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("history.sqlite3");
+        let store = Store::open(&path).await?;
+        let id = store.create_incident("Checkout").await?;
+        let mut work = JoinSet::new();
+        let mut requests = Refreshes::default();
+        refresh_incidents(&mut work, &path, Some(id), &mut requests);
+        let mut got_detail = false;
+        let mut got_list = false;
+        while let Some(work) = work.join_next().await {
+            match work? {
+                Work::UpdatedIncident(generation, requested, result) => {
+                    assert_eq!(generation, requests.detail);
+                    assert_eq!(requested, id);
+                    assert_eq!(result?.summary.id, id);
+                    got_detail = true;
+                }
+                Work::Incidents(generation, result) => {
+                    assert_eq!(generation, requests.incidents);
+                    assert_eq!(result?[0].id, id);
+                    got_list = true;
+                }
+                _ => anyhow::bail!("unexpected work result"),
+            }
+        }
+        assert!(got_detail && got_list);
+        Ok(())
+    }
 }

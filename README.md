@@ -107,8 +107,14 @@ rejected. Profile names must contain 1–64 ASCII letters, digits, `.`, `_`, or 
 | --- | --- |
 | `1`–`9`, `0`, `Tab`, `Shift+Tab` | Switch views |
 | `↑` / `↓`, `j` / `k`, `PgUp` / `PgDn` | Select rows or scroll a report |
-| `/` | Filter the current view; `Enter` applies, `Esc` cancels |
-| `Enter` in Overview | Open the complete selected finding and coverage, or coverage alone |
+| `/` | Edit this view's filter; `Enter` applies, `Esc` cancels. Report-only views and incident chronology have no filter |
+| `Enter` | Expand the selected finding, session, blocking relationship, statement or relation into scrollable details |
+| `h` | Read provenance, collection coverage, unavailable reasons and interval readiness |
+| `e` in Overview | Follow a finding to a reliably identified backend, relation or statement |
+| `b` / `w` in Activity or Blocking | Follow blocker / waiter relationships in the same observation |
+| `Backspace` | Return to the originating evidence and selection |
+| `[` / `]` in details or comparison | Jump to the previous / next section |
+| `Home` / `End` | Reach the first / last row of a list, report or help |
 | `v` in Statements | Switch cumulative/interval metrics |
 | `s` in Statements | Rank by execution time, mean time, or calls |
 | `v` in Relations | Switch tables/indexes |
@@ -122,12 +128,28 @@ rejected. Profile names must contain 1–64 ASCII letters, digits, `.`, `_`, or 
 | `I` in History | Attach the selected capture to the active incident |
 | `i` | Create an incident |
 | `n` | Add a note to the active incident |
-| `Enter` in Incidents | Inspect an incident and select it for new captures if open |
+| `Enter` in Incidents | Open the complete chronology and activate an open incident; in the chronology, inspect a capture or the full note |
+| `t` in Incidents | Switch between incident list and chronology |
+| `e` / `E` in Incidents | Export Markdown / JSON to a destination entered in the prompt; existing files are never overwritten |
 | `o` in Incidents | Close or reopen the selected incident |
 | `x` in Incidents | Clear the active capture target |
-| `Esc` | Close a dialog or return to live monitoring |
-| `?` | Show keyboard help |
+| `Esc` | Close details, return from attached evidence, leave chronology, clear the view filter, or return live |
+| `?` | Show scrollable keyboard help; use arrows, page keys or Home/End |
 | `q`, `Ctrl+C` | Quit and restore the terminal |
+
+Selections follow observed identities across refreshes: PID **and backend start** for
+sessions, the complete statement identity, relation OID, or finding ID. If an item
+disappears or its backend identity cannot be verified, a notice explains the change
+and the first visible row is selected. Filters are saved separately for each view;
+Statements matches explicitly captured SQL in both cumulative and interval modes.
+
+Details scroll through wrapped lines, including the end of long captured SQL.
+Contextual evidence navigation freezes the observation so following a blocker or
+waiter cannot silently switch to a newer sample. `Backspace` restores the originating
+view and selection; ordinary view switching leaves that navigation path. The header
+keeps observation age visible at 80×24 and identifies an open capture by ID and label.
+Coverage distinguishes synthetic provenance, collection completeness, and interval
+readiness; complete collection does not establish database health.
 
 Automatic collection runs every five seconds; change it with `--refresh SECONDS`.
 `--timeout SECONDS` bounds each collection/connection attempt. Paused, offline,
@@ -187,6 +209,13 @@ pgtrail annotate 7 --label 'Before pool adjustment' --note 'Observed queue growt
 pgtrail incident show 1 --format json --output checkout-incident.json
 ```
 
+In the TUI, `0` then `Enter` opens every incident note and attached capture in time
+order. Navigate with arrows or page keys; `Enter` reads a complete note or opens a
+capture offline, and `Backspace` returns to the selected chronology entry. `e` and
+`E` export the incident as Markdown or JSON without leaving the app. Enter a file
+path (relative to the working directory or absolute); the status line reports the
+destination or failure. Exports retain the CLI's private-file and no-overwrite rules.
+
 Capture annotation replaces the capture's note or label. Incident notes are separate,
 timestamped additions. Use actual IDs from the command output.
 
@@ -206,6 +235,11 @@ pgtrail delete 1                     # Deletes a local capture and its incident 
 
 `check`, `show`, `compare`, `diagnose`, and `incident show` accept
 `--format markdown|json` and `--output PATH`. `snapshots --json` lists captures.
+The TUI comparison starts with capture IDs and labels, elapsed interval, source
+compatibility, observed session/blocking changes and valid metric changes. `[` / `]`
+navigate sections, with the complete evidence and caveats below the summary.
+Changes resolved between observations do not establish that a root cause was fixed.
+
 Connection and storage errors exit nonzero. A collected observation with unavailable
 optional metrics succeeds and reports partial coverage. Export files use private
 permissions and refuse to overwrite an existing file. `show --format json` retains

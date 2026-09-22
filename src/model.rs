@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SNAPSHOT_VERSION: u32 = 2;
+pub(crate) const SYNTHETIC_SYSTEM_IDENTIFIER: &str = "pgtrail-demo-v1";
+pub(crate) const SYNTHETIC_WARNING: &str = "Synthetic demo data; no PostgreSQL connection is open.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "data", rename_all = "snake_case")]
@@ -45,10 +47,34 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn is_synthetic(&self) -> bool {
+        self.warnings
+            .iter()
+            .any(|warning| warning == SYNTHETIC_WARNING)
+    }
+
+    pub(crate) fn collected_sections(&self) -> usize {
+        [
+            self.activity.available().is_some(),
+            self.statements.available().is_some(),
+            self.health.database.available().is_some(),
+            self.health.tables.available().is_some(),
+            self.health.replication.available().is_some(),
+            self.health.wal.available().is_some(),
+            self.health.io.available().is_some(),
+            self.health.vacuum.available().is_some(),
+        ]
+        .into_iter()
+        .filter(|collected| *collected)
+        .count()
+    }
+
     pub(crate) fn is_complete(&self) -> bool {
         self.activity.available().is_some()
             && self.statements.available().is_some_and(|s| !s.truncated)
-            && self.warnings.is_empty()
+            // Provenance is not a collection gap. Every other warning keeps the
+            // existing conservative completeness check, including restricted roles.
+            && self.warnings.iter().all(|warning| warning == SYNTHETIC_WARNING)
             && (self.schema_version < 2 || self.health.is_complete())
     }
 }

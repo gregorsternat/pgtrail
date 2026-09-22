@@ -1,4 +1,7 @@
+mod details;
 mod investigation;
+
+pub(crate) use details::detail_report;
 
 use ratatui::{
     Frame,
@@ -14,7 +17,9 @@ use crate::{
 };
 
 const ACCENT: Color = Color::Cyan;
-const MUTED: Color = Color::DarkGray;
+// Use the terminal's configured foreground for readable secondary text on both
+// light and dark themes. Status and selection also have textual markers.
+const MUTED: Color = Color::Reset;
 const WARNING: Color = Color::Yellow;
 
 pub(crate) fn render(frame: &mut Frame, app: &App) {
@@ -27,7 +32,7 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
         return;
     }
     let [header, tabs, body, message, filter, footer] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if app.capture.is_some() { 3 } else { 2 }),
         Constraint::Length(2),
         Constraint::Min(0),
         Constraint::Length(if app.error.is_some() || app.notice.is_some() {
@@ -93,30 +98,54 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
             message,
         );
     }
-    let filter_text = if app.editing_filter {
+    let filter_text = if app.report.is_some() && app.has_return_path() {
+        " [ / ]: previous / next section  Home/End: first/last  Backspace: return".into()
+    } else if app.report.is_some() {
+        " [ / ]: previous / next section  Home/End: first/last".into()
+    } else if !app.filter_available() {
+        " j/k: scroll  Tab / 1–9,0: view  h: coverage".into()
+    } else if app.editing_filter {
         format!(
-            " /{}▏  Enter: apply  Esc: cancel  Ctrl+U: clear",
+            " {} /{}▏  Enter: apply  Esc: cancel  Ctrl+U: clear",
+            app.tab.title(),
             app.filter
         )
     } else if !app.filter.is_empty() {
-        format!(" Filter: {}  /: edit  Esc: clear", app.filter)
+        format!(
+            " {} filter: {}  /: edit  Esc: clear",
+            app.tab.title(),
+            app.filter
+        )
     } else {
-        " /: filter  j/k: select  Tab / 1–9,0: view".into()
+        format!(
+            " /: filter {}  j/k: select  Tab / 1–9,0: view",
+            app.tab.title()
+        )
     };
     frame.render_widget(
         Paragraph::new(filter_text).fg(if app.editing_filter { ACCENT } else { MUTED }),
         filter,
     );
-    let footer_text = if app.report.is_some() {
-        " ↑/↓ PgUp/PgDn: scroll  Esc: close report  ?: help  q: quit"
+    let footer_text = if app.report.is_some() && app.tab == Tab::Overview {
+        " ↑/↓ PgUp/PgDn: scroll  e: evidence  Esc: close  ?: help  q: quit"
+    } else if app.report.is_some() && matches!(app.tab, Tab::Activity | Tab::Blocking) {
+        " ↑/↓ PgUp/PgDn: scroll  b/w: blocker/waiter  Esc: close  ?: help"
+    } else if app.report.is_some() {
+        " ↑/↓ PgUp/PgDn: scroll  Esc: close  ?: help  q: quit"
     } else if app.tab == Tab::History {
         " Enter: inspect  a/b: mark  d: compare  l: label  I: attach  ?: help"
     } else if app.tab == Tab::Incidents {
-        " Enter: activate  i: new  n: note  o: close/reopen  x: clear target  ?: help"
+        " Enter: inspect  e/E: export md/json  t: list/timeline  n: note  ?: help"
     } else if app.tab == Tab::Relations {
-        " v: tables/indexes  s: sort  i: new incident  c: capture  ?: help  q: quit"
+        " Enter: full details  v: tables/indexes  s: sort  c: capture  ?: help"
     } else if app.tab == Tab::Statements {
-        " v: cumulative/interval  s: sort  c: capture  n: incident note  ?: help"
+        " Enter: full details  v: cumulative/interval  s: sort  c: capture  ?: help"
+    } else if matches!(app.tab, Tab::Activity | Tab::Blocking) && app.has_return_path() {
+        " Enter: full details  b/w: blocker/waiter  Backspace: return  ?: help"
+    } else if matches!(app.tab, Tab::Activity | Tab::Blocking) {
+        " Enter: full details  b/w: blocker/waiter  c: capture  ?: help  q: quit"
+    } else if app.tab == Tab::Overview {
+        " Enter: finding  e: evidence  h: coverage  c: capture  ?: help  q: quit"
     } else if app.is_offline() {
         " OFFLINE  Esc: return to live  5: history  ?: help  q: quit"
     } else {
@@ -124,7 +153,7 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(Paragraph::new(footer_text).fg(ACCENT), footer);
     if app.help {
-        render_help(frame, area);
+        render_help(frame, area, app.help_scroll);
     }
     if app.prompt.is_some() {
         investigation::prompt(frame, area, app);
@@ -138,6 +167,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         (report_status.as_str(), ACCENT)
     } else if comparison {
         ("OFFLINE COMPARISON", WARNING)
+    } else if app.capture.is_none() && app.has_return_path() {
+        ("FROZEN EVIDENCE", WARNING)
     } else if app.is_offline() {
         ("OFFLINE CAPTURE", WARNING)
     } else if app.demo {
@@ -158,7 +189,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let mut headline = vec![
         Span::styled(" pgtrail ", Style::new().bold().fg(ACCENT)),
         Span::raw(" │ "),
-        Span::styled(status, Style::new().fg(color).bold()),
+        Span::styled("● ", Style::new().fg(color)),
+        Span::styled(status, Style::new().bold()),
     ];
     if let Some(id) = app.active_incident {
         headline.push(Span::styled(
@@ -178,13 +210,12 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         match app.snapshot() {
             Some(snapshot) => {
                 let age = (app.now - snapshot.completed_at).num_seconds().max(0);
+                let context_width = usize::from(area.width.saturating_sub(36));
+                let endpoint = fit_text(&clean(&snapshot.source.endpoint), context_width / 2);
+                let database = fit_text(&clean(&snapshot.source.database), context_width / 2);
                 format!(
-                    " {} / {} · PostgreSQL {} · observed {} UTC · {}s ago",
-                    clean(&snapshot.source.endpoint),
-                    clean(&snapshot.source.database),
-                    clean(&snapshot.source.server_version),
-                    snapshot.completed_at.format("%H:%M:%S"),
-                    age
+                    " Observed {age}s ago · {endpoint} / {database} · PG {}",
+                    clean(&snapshot.source.server_version)
                 )
             }
             None => {
@@ -192,10 +223,16 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     };
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(headline), Line::from(source).fg(MUTED)]),
-        area,
-    );
+    let mut lines = vec![Line::from(headline), Line::from(source)];
+    if let Some(capture) = &app.capture {
+        lines.push(Line::raw(format!(
+            " Capture #{} · {} · {} UTC",
+            capture.id,
+            clean(&capture.label),
+            capture.captured_at.format("%Y-%m-%d %H:%M:%S")
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_activity(frame: &mut Frame, area: Rect, app: &App) {
@@ -245,10 +282,10 @@ fn render_activity(frame: &mut Frame, area: Rect, app: &App) {
     let mut headers = vec!["PID", "User", "State", "Query age", "Tx age", "Wait"];
     let mut widths = vec![
         Constraint::Length(7),
-        Constraint::Length(13),
-        Constraint::Length(20),
-        Constraint::Length(11),
-        Constraint::Length(11),
+        Constraint::Length(if wide { 13 } else { 10 }),
+        Constraint::Length(if wide { 20 } else { 14 }),
+        Constraint::Length(10),
+        Constraint::Length(9),
         Constraint::Min(8),
     ];
     if wide {
@@ -265,7 +302,12 @@ fn render_activity(frame: &mut Frame, area: Rect, app: &App) {
     if detail_height > 0
         && let Some(session) = sessions.get(app.selected())
     {
-        render_session_details(frame, details, session, " Selected session ");
+        render_session_details(
+            frame,
+            details,
+            session,
+            " Selected session · Enter: full details ",
+        );
     }
 }
 
@@ -295,8 +337,7 @@ fn render_blocking(frame: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<_> = edges
         .iter()
         .map(|(waiter, blocker_pid)| {
-            let blocker =
-                all_sessions.and_then(|sessions| sessions.iter().find(|s| s.pid == *blocker_pid));
+            let blocker = all_sessions.and_then(|sessions| unique_session(sessions, *blocker_pid));
             Row::new(vec![
                 waiter.pid.to_string(),
                 format!("→ {blocker_pid}"),
@@ -339,7 +380,7 @@ fn render_blocking(frame: &mut Frame, area: Rect, app: &App) {
         && let Some((waiter, blocker_pid)) = edges.get(app.selected())
     {
         if let Some(blocker) =
-            all_sessions.and_then(|sessions| sessions.iter().find(|s| s.pid == *blocker_pid))
+            all_sessions.and_then(|sessions| unique_session(sessions, *blocker_pid))
         {
             render_session_details(
                 frame,
@@ -469,7 +510,7 @@ fn render_statements(frame: &mut Frame, area: Rect, app: &App) {
         ];
         frame.render_widget(
             Paragraph::new(lines)
-                .block(panel(" Statement details "))
+                .block(panel(" Statement preview · Enter: full details "))
                 .wrap(Wrap { trim: true }),
             details,
         );
@@ -551,29 +592,74 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_report(frame: &mut Frame, area: Rect, app: &App, report: &str) {
-    let lines: Vec<_> = report
-        .lines()
-        .skip(app.report_scroll)
-        .map(|line| {
-            let style = if line.starts_with('#') {
-                Style::new().fg(ACCENT).bold()
-            } else if line.contains("unavailable")
-                || line.contains("reset")
-                || line.contains("incompatible")
-            {
-                Style::new().fg(WARNING)
-            } else {
-                Style::new()
-            };
-            Line::styled(clean(line), style)
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel(format!(" {} · ↑/↓ to scroll ", app.report_title)))
-            .wrap(Wrap { trim: false }),
-        area,
+    let rows = report_lines(report, area.width.saturating_sub(2));
+    let visible = usize::from(area.height.saturating_sub(2));
+    let offset = app.report_scroll.min(rows.len().saturating_sub(visible));
+    let end = (offset + visible).min(rows.len());
+    let title = format!(
+        " {} · rows {}–{}/{} ",
+        app.report_title,
+        offset + usize::from(!rows.is_empty()),
+        end,
+        rows.len()
     );
+    let lines: Vec<_> = rows
+        .into_iter()
+        .skip(offset)
+        .take(visible)
+        .map(report_line)
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(panel(title)), area);
+}
+
+fn report_line(line: String) -> Line<'static> {
+    let style = if line.starts_with('#') {
+        Style::new().fg(ACCENT).bold()
+    } else if line.contains("unavailable")
+        || line.contains("reset")
+        || line.contains("incompatible")
+    {
+        Style::new().fg(WARNING)
+    } else {
+        Style::new()
+    };
+    Line::styled(line, style)
+}
+
+/// Prewrap by terminal cell width so scrolling counts displayed rows, including
+/// very long SQL values, rather than skipping whole unwrapped source lines.
+pub(crate) fn report_lines(report: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(2));
+    let mut rows = Vec::new();
+    for line in report.lines() {
+        let mut row = String::new();
+        for character in clean(line).chars() {
+            row.push(character);
+            if Span::raw(row.as_str()).width() > width {
+                row.pop();
+                rows.push(std::mem::take(&mut row));
+                row.push(character);
+            }
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+fn fit_text(text: &str, width: usize) -> String {
+    if Span::raw(text).width() <= width {
+        return text.into();
+    }
+    let mut shortened = String::new();
+    for character in text.chars() {
+        shortened.push(character);
+        if Span::raw(shortened.as_str()).width() >= width {
+            shortened.pop();
+            break;
+        }
+    }
+    shortened.push('…');
+    shortened
 }
 
 fn render_session_details(frame: &mut Frame, area: Rect, session: &Session, title: &str) {
@@ -628,50 +714,83 @@ fn render_session_details(frame: &mut Frame, area: Rect, session: &Session, titl
     );
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let width = area.width.saturating_sub(2).min(90);
-    let height = area.height.saturating_sub(2).min(27);
+pub(crate) fn help_dimensions(width: u16, height: u16) -> (u16, u16) {
+    (
+        width.saturating_sub(2).min(90),
+        height.saturating_sub(2).min(31),
+    )
+}
+
+pub(crate) fn help_lines(width: u16) -> Vec<String> {
+    report_lines(
+        "# NAVIGATION
+Tab / Shift+Tab / 1–9,0   Switch among ten investigation views
+↑/↓ or j/k · PgUp/PgDn    Select rows / scroll; Home/End: first/last
+/                        Filter this view; Enter: apply, Esc: cancel
+Esc                      Clear filter / close report / return live
+Backspace                Return to the originating finding or incident
+r / p / c                Refresh / pause / collect and save
+
+# INVESTIGATION
+Enter                    Full finding, session, blocking, statement or relation details
+e in Overview            Follow the selected finding to related evidence
+b / w                    Follow a blocker / waiter from a session or relationship
+h                        Read provenance, collection coverage and interval readiness
+[ / ] in a report        Previous / next section; full evidence stays accessible
+4 Statements: v / s      Cumulative ↔ interval / change ranking
+7 Relations: v / s        Tables ↔ indexes / change ranking
+6 Database · 8 Replica · 9 I/O: j/k scroll detailed metrics
+
+# HISTORY AND INCIDENTS
+5 History: Enter         Inspect selected capture offline
+a / b / d / l            Mark earlier / later / compare / edit label
+i                        Create and activate a local incident
+0 Incidents: Enter       Open the full chronology; activate if open
+n                        Add a note to the active incident
+I in History             Attach selected capture to active incident
+o / x in Incidents       Close or reopen / stop attaching new captures
+t / Esc in timeline      Return to incident list; t reopens the timeline
+Enter in timeline        Open a capture or the full selected note
+e / E in Incidents       Export Markdown / JSON to a new private destination
+
+# SAFETY AND EXIT
+Read-only. Unavailable metrics remain unavailable. SQL text requires opt-in.
+? / Esc                  Close help
+q / Ctrl+C               Quit and restore the terminal",
+        width,
+    )
+}
+
+fn render_help(frame: &mut Frame, area: Rect, scroll: usize) {
+    let (width, height) = help_dimensions(area.width, area.height);
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
         width,
         height,
     );
-    let lines = vec![
-        Line::raw("NAVIGATION").fg(ACCENT).bold(),
-        Line::raw("Tab / Shift+Tab / 1–9,0   Switch among ten investigation views"),
-        Line::raw("↑/↓ or j/k · PgUp/PgDn    Select rows / scroll; Home/End: first/last"),
-        Line::raw("/                        Filter; Enter: apply, Esc: cancel"),
-        Line::raw("Esc                      Clear filter / close report / return live"),
-        Line::raw("r / p / c                Refresh / pause / collect and save"),
-        Line::raw(""),
-        Line::raw("INVESTIGATION").fg(ACCENT).bold(),
-        Line::raw("Overview: Enter          Read full finding evidence and next steps"),
-        Line::raw("4 Statements: v / s      Cumulative ↔ interval / change ranking"),
-        Line::raw("7 Relations: v / s       Tables ↔ indexes / change ranking"),
-        Line::raw("6 Database · 8 Replica · 9 I/O: j/k scroll detailed metrics"),
-        Line::raw(""),
-        Line::raw("HISTORY AND INCIDENTS").fg(ACCENT).bold(),
-        Line::raw("5 History: Enter         Inspect selected capture offline"),
-        Line::raw("a / b / d / l            Mark earlier / later / compare / edit label"),
-        Line::raw("i                        Create and activate a local incident"),
-        Line::raw("0 Incidents: Enter       Inspect; activate if open for new captures"),
-        Line::raw("n                        Add a note to the active incident"),
-        Line::raw("I in History             Attach selected capture to active incident"),
-        Line::raw("o / x in Incidents       Close or reopen / stop attaching new captures"),
-        Line::raw(""),
-        Line::raw("? / Esc: close help       q / Ctrl+C: quit and restore terminal"),
-        Line::raw("Read-only. Unknown metrics stay unavailable. SQL is opt-in.").fg(MUTED),
-    ];
+    let rows = help_lines(width.saturating_sub(2));
+    let visible = usize::from(height.saturating_sub(2));
+    let offset = scroll.min(rows.len().saturating_sub(visible));
+    let title = format!(
+        " Keyboard help · {}/{} · ↑/↓ PgUp/PgDn Home/End ",
+        offset + 1,
+        rows.len()
+    );
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::bordered()
-                    .title(" Keyboard help ")
-                    .border_style(Style::new().fg(ACCENT)),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(
+            rows.into_iter()
+                .skip(offset)
+                .take(visible)
+                .map(report_line)
+                .collect::<Vec<_>>(),
+        )
+        .block(
+            Block::bordered()
+                .title(title)
+                .border_style(Style::new().fg(ACCENT)),
+        ),
         popup,
     );
 }
@@ -685,7 +804,7 @@ fn render_table(frame: &mut Frame, area: Rect, table: Table<'_>, selected: usize
         .with_offset(selected.saturating_sub(visible_rows - 1));
     frame.render_stateful_widget(
         table
-            .row_highlight_style(Style::new().bg(Color::DarkGray).fg(Color::White).bold())
+            .row_highlight_style(Style::new().reversed().bold())
             .highlight_symbol("› "),
         area,
         &mut state,
@@ -725,8 +844,14 @@ fn unresolved_blocker(pid: i32) -> &'static str {
     if pid == 0 {
         "Prepared transaction (no backend PID)"
     } else {
-        "Not visible / already exited"
+        "Not visible / exited / ambiguous"
     }
+}
+
+fn unique_session(sessions: &[Session], pid: i32) -> Option<&Session> {
+    let mut matches = sessions.iter().filter(|session| session.pid == pid);
+    let session = matches.next()?;
+    matches.next().is_none().then_some(session)
 }
 
 fn value(value: Option<&str>) -> String {
@@ -819,8 +944,8 @@ mod tests {
         app.set_snapshot(snapshot(), false);
         let text = screen(&app, 120, 30)?;
         assert!(text.contains("LIVE · CONNECTED"));
-        assert!(text.contains("Statement metrics unavailable: Extension is not installed"));
-        assert!(text.contains("INCOMPLETE"));
+        assert!(text.contains("Extension is not installed"));
+        assert!(text.contains("Collection: 1/8 sections; 7 unavailable"));
         app.set_error("Database could not be reached".into());
         let text = screen(&app, 120, 30)?;
         assert!(text.contains("STALE · COLLECTION FAILED"));
@@ -1007,6 +1132,174 @@ mod tests {
             assert!(screen(&app, width, height)?.contains("Constraint"));
             app.show_indexes = false;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_header_keeps_freshness_source_and_capture_identity() -> Result<(), Infallible> {
+        let mut app = App::new(true);
+        let mut observation = crate::demo::snapshot(0, false);
+        observation.source.endpoint = "some-extraordinarily-long-development-endpoint:5432".into();
+        observation.source.database = "checkout_database_with_a_long_name".into();
+        let now = observation.completed_at + chrono::Duration::seconds(42);
+        app.set_snapshot(observation, true);
+        app.now = now;
+        app.capture = Some(SnapshotSummary {
+            id: 123,
+            label: "Before pool adjustment".into(),
+            captured_at: app.now,
+            source: "fixture".into(),
+            complete: true,
+        });
+        app.tab = Tab::Activity;
+        for (width, height) in [(80, 24), (120, 36)] {
+            let text = screen(&app, width, height)?;
+            assert!(text.contains("Observed 42s ago"));
+            assert!(text.contains("checkout"));
+            assert!(text.contains("some-extraord"));
+            assert!(text.contains("Capture #123 · Before pool adjustment"));
+            assert!(text.contains("Enter: full details"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_details_reach_long_sql_end_at_both_sizes() -> Result<(), Infallible> {
+        for (width, height) in [(80, 24), (120, 36)] {
+            let mut app = App::new(true);
+            let mut observation = crate::demo::snapshot(0, true);
+            let query = format!(
+                "SELECT {}\nFROM fixture_table; END_OF_CAPTURED_SQL",
+                "long_column, ".repeat(500)
+            );
+            if let Observation::Available(sessions) = &mut observation.activity {
+                for session in sessions {
+                    session.query = Some(query.clone());
+                }
+            }
+            if let Observation::Available(statements) = &mut observation.statements {
+                for statement in &mut statements.entries {
+                    statement.query = Some(query.clone());
+                }
+            }
+            app.set_snapshot(observation, false);
+            for tab in [Tab::Activity, Tab::Blocking, Tab::Statements] {
+                app.tab = tab;
+                let (title, report) =
+                    detail_report(&app).expect("demo has selected detail evidence");
+                assert!(report.contains(&query));
+                app.report = Some(report);
+                app.report_title = title;
+                app.report_scroll = usize::MAX;
+                let text = screen(&app, width, height)?;
+                assert!(
+                    text.contains("END_OF_CAPTURED_SQL"),
+                    "{width}x{height} {tab:?}"
+                );
+                assert!(text.contains("rows "));
+                app.report = None;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scrollable_help_exposes_final_actions_and_navigation() -> Result<(), Infallible> {
+        let mut app = App::new(true);
+        app.help = true;
+        for (width, height) in [(80, 24), (120, 36)] {
+            app.help_scroll = 0;
+            let first = screen(&app, width, height)?;
+            assert!(first.contains("NAVIGATION"));
+            assert!(first.contains("PgUp/PgDn Home/End"));
+            app.help_scroll = usize::MAX;
+            let last = screen(&app, width, height)?;
+            assert!(last.contains("HISTORY AND INCIDENTS"));
+            assert!(last.contains("Quit and restore the terminal"));
+            assert!(last.contains("SQL text requires opt-in"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn report_wrap_preserves_sql_and_wide_characters() {
+        let report = "SELECT \"中文名称\", extraordinarily_long_column FROM table;";
+        for width in [8, 20, 78] {
+            let rows = report_lines(report, width);
+            assert_eq!(rows.concat(), report);
+            assert!(
+                rows.iter()
+                    .all(|row| Span::raw(row.as_str()).width() <= usize::from(width))
+            );
+        }
+        assert_eq!(report_lines("a\u{1b}[31m\nb", 78), ["a [31m", "b"]);
+    }
+
+    #[test]
+    fn interval_and_relation_reports_retain_identity_and_missing_values() {
+        let mut app = App::new(true);
+        let first = crate::demo::snapshot(0, true);
+        let mut second = first.clone();
+        second.started_at = first.completed_at + chrono::Duration::seconds(5);
+        second.completed_at = second.started_at;
+        app.set_snapshot(first, false);
+        app.set_snapshot(second, false);
+        app.tab = Tab::Statements;
+        app.statement_interval = true;
+        let (_, report) = detail_report(&app).expect("interval detail");
+        assert!(report.contains("Top level: true"));
+        assert!(report.contains("No completed calls in this interval"));
+        assert!(report.contains("SELECT ") || report.contains("UPDATE "));
+        assert!(report.contains("Elapsed interval: 5.000 seconds"));
+        app.tab = Tab::Relations;
+        let (_, table) = detail_report(&app).expect("table detail");
+        assert!(table.contains("Relation OID:"));
+        assert!(table.contains("Last autoanalyze:"));
+        assert!(table.contains("Frozen transaction ID age:"));
+        app.show_indexes = true;
+        let (_, index) = detail_report(&app).expect("index detail");
+        assert!(index.contains("Index OID:"));
+        assert!(index.contains("Primary:"));
+        assert!(index.contains("Heap tuples fetched:"));
+    }
+
+    #[test]
+    fn ambiguous_blocker_report_does_not_pick_an_arbitrary_backend() {
+        let mut observation = crate::demo::snapshot(0, true);
+        if let Observation::Available(sessions) = &mut observation.activity {
+            let blocker = sessions
+                .iter_mut()
+                .find(|session| session.pid == 4101)
+                .expect("demo blocker");
+            blocker.query = Some("AMBIGUOUS_BLOCKER_SQL".into());
+            let duplicate = blocker.clone();
+            sessions.push(duplicate);
+        }
+        let mut app = App::new(true);
+        app.set_snapshot(observation, false);
+        app.tab = Tab::Blocking;
+        let (_, report) = detail_report(&app).expect("blocking detail");
+        assert!(report.contains("Identity unavailable or ambiguous"));
+        assert!(!report.contains("AMBIGUOUS_BLOCKER_SQL"));
+    }
+
+    #[test]
+    fn inactive_filter_controls_are_absent_and_selection_has_a_marker() -> Result<(), Infallible> {
+        let mut app = App::new(true);
+        app.set_snapshot(crate::demo::snapshot(0, false), false);
+        for tab in [Tab::Database, Tab::Replication, Tab::Io] {
+            app.tab = tab;
+            let text = screen(&app, 80, 24)?;
+            assert!(!text.contains("/: filter"));
+        }
+        app.tab = Tab::Activity;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        terminal.draw(|frame| render(frame, &app))?;
+        let buffer = terminal.backend().buffer();
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == "›"));
+        // Theme-configured foreground keeps freshness readable without assuming
+        // a light or dark terminal background.
+        assert_eq!(buffer[(1, 1)].fg, Color::Reset);
         Ok(())
     }
 }

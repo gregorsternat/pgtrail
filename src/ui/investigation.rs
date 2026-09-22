@@ -25,7 +25,7 @@ pub(super) fn overview(frame: &mut Frame, area: Rect, app: &App) {
         0
     };
     let [summary, list, details] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(5),
         Constraint::Min(0),
         Constraint::Length(details_height),
     ])
@@ -40,39 +40,31 @@ pub(super) fn overview(frame: &mut Frame, area: Rect, app: &App) {
             )
         },
     );
-    let mut lines = vec![Line::raw(format!(
-        "{} · {} · {} findings",
-        if snapshot.is_complete() {
-            "Complete observation"
-        } else {
-            "INCOMPLETE observation"
-        },
-        activity,
-        analysis.findings.len()
-    ))];
-    if let Observation::Unavailable(reason) = &snapshot.statements {
-        lines.push(
-            Line::raw(format!("Statement metrics unavailable: {}", clean(reason))).fg(WARNING),
-        );
-    } else {
-        lines.push(Line::raw("Findings are investigation hints. Select one and press Enter for full evidence and next steps.").fg(MUTED));
-    }
-    lines.push(
+    let limit = analysis
+        .coverage
+        .iter()
+        .skip(3)
+        .find(|line| !line.ends_with(": collected") && !line.starts_with("No finding"));
+    let lines = vec![
         Line::raw(format!(
-            "Coverage: {}",
-            if analysis.coverage.is_empty() {
-                "No missing sections reported".into()
+            "{} · h: full coverage details",
+            if snapshot.is_synthetic() {
+                "SYNTHETIC demo"
             } else {
-                analysis
-                    .coverage
-                    .iter()
-                    .map(|s| clean(s))
-                    .collect::<Vec<_>>()
-                    .join(" · ")
+                "PostgreSQL observation"
             }
         ))
+        .fg(ACCENT)
+        .bold(),
+        Line::raw(crate::diagnostics::collection_summary(snapshot)),
+        Line::raw(limit.map_or_else(
+            || "Section and interval reasons are available with h.".into(),
+            |reason| format!("Limit: {}", clean(reason)),
+        ))
         .fg(WARNING),
-    );
+        Line::raw(crate::diagnostics::interval_summary(&analysis.rates)),
+        Line::raw(format!("{activity} · {} findings", analysis.findings.len())),
+    ];
     frame.render_widget(Paragraph::new(lines), summary);
     let findings = app.filtered_findings();
     if findings.is_empty() {
@@ -80,10 +72,13 @@ pub(super) fn overview(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             list,
             " Findings ",
-            if app.filter.is_empty() {
-                "No configured findings triggered in the available evidence.\nThis does not prove database health; review coverage and workload context."
+            &if app.filter.is_empty() {
+                "No configured findings triggered in the available evidence.\nThis does not prove database health; review coverage and workload context.".into()
             } else {
-                "No findings match this filter. Press Esc to clear it."
+                format!(
+                    "No findings match Overview filter {:?}. Press / to change it, or Esc to clear it.",
+                    clean(&app.filter)
+                )
             },
         );
     } else {
@@ -364,7 +359,10 @@ pub(super) fn relations(frame: &mut Frame, area: Rect, app: &App) {
             detail_lines.push(Line::raw("Scan counts are cumulative and can reset; low usage alone does not justify removal.").fg(MUTED));
             detail_lines.push(Line::raw("Check constraints, workload coverage and query plans before changing an index.").fg(MUTED));
         } else {
-            detail_lines.push(Line::raw("No indexes match this observation and filter."));
+            detail_lines.push(Line::raw(format!(
+                "No indexes match Relations filter {:?}.",
+                clean(&app.filter)
+            )));
         }
     } else {
         let tables = app.filtered_tables();
@@ -437,13 +435,16 @@ pub(super) fn relations(frame: &mut Frame, area: Rect, app: &App) {
                     .fg(MUTED),
             );
         } else {
-            detail_lines.push(Line::raw("No tables match this observation and filter."));
+            detail_lines.push(Line::raw(format!(
+                "No tables match Relations filter {:?}.",
+                clean(&app.filter)
+            )));
         }
     }
     if detail_height > 0 {
         frame.render_widget(
             Paragraph::new(detail_lines)
-                .block(panel(" Selected relation · maintenance context "))
+                .block(panel(" Selected relation · Enter: full details "))
                 .wrap(Wrap { trim: false }),
             details,
         );
@@ -682,7 +683,10 @@ pub(super) fn statement_rates(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             area,
             " Statement intervals ",
-            "No statement identities match this interval and filter. Press v for cumulative statistics.",
+            &format!(
+                "No statements match Statements filter {:?} in this interval. Press / to change it, Esc to clear it, or v for cumulative statistics.",
+                clean(&app.filter)
+            ),
         );
         return;
     }
@@ -752,7 +756,7 @@ pub(super) fn statement_rates(frame: &mut Frame, area: Rect, app: &App) {
         }
         frame.render_widget(
             Paragraph::new(lines)
-                .block(panel(" Interval details · — retains its reason below "))
+                .block(panel(" Interval details · Enter: full details "))
                 .wrap(Wrap { trim: false }),
             details,
         );
@@ -760,118 +764,137 @@ pub(super) fn statement_rates(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn incidents(frame: &mut Frame, area: Rect, app: &App) {
+    if app.incident_timeline
+        && let Some(incident) = &app.incident
+    {
+        incident_timeline(frame, area, app, incident);
+        return;
+    }
     let incidents = app.filtered_incidents();
-    if incidents.is_empty() && app.incident.is_none() {
-        render_empty(
-            frame,
-            area,
-            " Local incidents ",
-            "No incidents match this view.\n\nPress i to create a case, c to capture evidence, and n to add a note.\nOpen incidents group related observations across database restarts.\nReports can be exported with: pgtrail incident show ID --output incident.md",
-        );
+    if incidents.is_empty() {
+        let message = if app.filter.is_empty() {
+            "No incidents yet. Press i to create a case, c to capture evidence, and n to add a note.".into()
+        } else {
+            format!(
+                "No incidents match filter {:?}. Press / to change or clear it.",
+                app.filter
+            )
+        };
+        render_empty(frame, area, " Local incidents ", &message);
         return;
     }
     let [table_area, details] =
-        Layout::vertical([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(area);
-    let rows = incidents.iter().map(|i| {
+        Layout::vertical([Constraint::Min(6), Constraint::Length(5)]).areas(area);
+    let rows = incidents.iter().map(|incident| {
         Row::new(vec![
-            if app.active_incident == Some(i.id) {
-                "●".into()
+            if app.active_incident == Some(incident.id) {
+                "*".into()
             } else {
                 String::new()
             },
-            i.id.to_string(),
-            clean(&i.title),
-            if i.closed_at.is_some() {
+            incident.id.to_string(),
+            clean(&incident.title),
+            if incident.closed_at.is_some() {
                 "closed".into()
             } else {
                 "open".into()
             },
-            i.capture_count.to_string(),
-            i.note_count.to_string(),
+            incident.capture_count.to_string(),
+            incident.note_count.to_string(),
         ])
     });
     let table = Table::new(
         rows,
         [
             Constraint::Length(1),
+            Constraint::Length(5),
+            Constraint::Min(10),
             Constraint::Length(6),
-            Constraint::Min(18),
-            Constraint::Length(7),
             Constraint::Length(8),
-            Constraint::Length(6),
+            Constraint::Length(5),
         ],
     )
     .header(table_header(vec![
         "", "ID", "Incident", "State", "Captures", "Notes",
     ]))
     .block(panel(
-        " Incidents · ● active capture destination · Enter: open ",
+        " Incidents · * active destination · Enter: timeline ",
     ));
     render_table(frame, table_area, table, app.selected());
-    if let Some(incident) = &app.incident {
-        let mut lines = vec![Line::raw(format!(
-            "Opened {} · {}",
-            timestamp(Some(incident.summary.created_at)),
-            incident.summary.closed_at.map_or_else(
-                || "open".into(),
-                |at| format!("closed {}", timestamp(Some(at)))
-            )
-        ))];
-        lines.push(Line::raw("Recent notes").fg(ACCENT));
-        if incident.notes.is_empty() {
-            lines.push(Line::raw(
-                "No notes yet. Press n to add context to the active incident.",
-            ));
-        }
-        for note in incident.notes.iter().rev().take(3) {
-            lines.push(Line::raw(format!(
-                "{}  {}",
-                note.created_at.format("%m-%d %H:%M UTC"),
-                clean(&note.text)
-            )));
-        }
-        lines.push(Line::raw("Recent captures · inspect in History (5)").fg(ACCENT));
-        if incident.captures.is_empty() {
-            lines.push(Line::raw(
-                "No captures attached. Press c for fresh evidence, or I on a History row.",
-            ));
-        }
-        for capture in incident.captures.iter().rev().take(4) {
-            lines.push(Line::raw(format!(
-                "#{}  {}  {}  {}",
-                capture.id,
-                capture.captured_at.format("%H:%M:%S UTC"),
-                clean(&capture.label),
-                if capture.complete {
-                    "complete"
-                } else {
-                    "INCOMPLETE"
-                }
-            )));
-        }
-        lines.push(
+    render_empty(
+        frame,
+        details,
+        " Incident actions ",
+        "Enter: full chronology · e: export Markdown · E: export JSON\ni: create · n: add note · o: close/reopen · x: clear destination\nOpen incidents become the destination for new captures. Exports require a new file path.",
+    );
+}
+
+fn incident_timeline(frame: &mut Frame, area: Rect, app: &App, incident: &crate::store::Incident) {
+    let entries = crate::incidents::timeline(incident);
+    let [header, table_area, details] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(4),
+        Constraint::Length(6),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(vec![
             Line::raw(format!(
-                "Full timeline and report: pgtrail incident show {}",
-                incident.summary.id
-            ))
-            .fg(MUTED),
-        );
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(panel(format!(
-                    " Opened #{} · {} ",
-                    incident.summary.id,
-                    clean(&incident.summary.title)
-                )))
-                .wrap(Wrap { trim: false }),
-            details,
-        );
-    } else {
+                "#{}: {} · {}",
+                incident.summary.id,
+                clean(&incident.summary.title),
+                if incident.summary.closed_at.is_some() {
+                    "closed"
+                } else {
+                    "open"
+                }
+            )),
+            Line::raw("Enter: open capture / full note · e: Markdown · E: JSON"),
+            Line::raw("↑/↓ PgUp/PgDn Home/End: timeline · t/Esc: incident list"),
+        ]),
+        header,
+    );
+    if entries.is_empty() {
         render_empty(
             frame,
+            table_area,
+            " Full chronology ",
+            "No observations yet. Press n to add a note or c to capture evidence.",
+        );
+        return;
+    }
+    let table = Table::new(
+        entries.iter().map(|entry| {
+            Row::new(vec![
+                entry.at.format("%m-%d %H:%M:%S").to_string(),
+                clean(&entry.title),
+            ])
+        }),
+        [Constraint::Length(15), Constraint::Min(10)],
+    )
+    .header(table_header(vec!["Time (UTC)", "Evidence / note"]))
+    .block(panel(format!(
+        " Full chronology · {}/{} ",
+        app.incident_cursor + 1,
+        entries.len()
+    )));
+    render_table(frame, table_area, table, app.incident_cursor);
+    if let Some(entry) = entries.get(app.incident_cursor) {
+        frame.render_widget(
+            Paragraph::new(
+                entry
+                    .detail
+                    .lines()
+                    .map(|line| Line::raw(clean(line)))
+                    .collect::<Vec<_>>(),
+            )
+            .block(panel(if entry.capture_id.is_some() {
+                " Selected capture · Enter: inspect "
+            } else {
+                " Selected note · Enter: full scrollable text "
+            }))
+            .wrap(Wrap { trim: false }),
             details,
-            " Incident details ",
-            "Select an incident and press Enter to read its notes and captures.\nAn open incident becomes the destination for new captures.",
         );
     }
 }
@@ -892,6 +915,10 @@ pub(super) fn prompt(frame: &mut Frame, area: Rect, app: &App) {
         PromptKind::Incident => " New incident ".into(),
         PromptKind::Note(id) => format!(" Note for incident #{id} "),
         PromptKind::Label(id) => format!(" Label for capture #{id} "),
+        PromptKind::ExportIncident(id, json) => format!(
+            " Export incident #{id} as {} · new file path ",
+            if json { "JSON" } else { "Markdown" }
+        ),
     };
     let max_visible =
         usize::from(width.saturating_sub(4)) * usize::from(height.saturating_sub(4)).max(1);

@@ -3,18 +3,20 @@ use crate::{
     compare::{BlockingEdge, Comparison, SessionChange, StatementChange, StatementDelta},
     diagnostics::{self, Analysis},
     metrics::IntervalMetrics,
-    model::{Observation, Session, Snapshot, Statement},
+    model::{Observation, SYNTHETIC_SYSTEM_IDENTIFIER, Session, Snapshot, Statement},
+    store::SnapshotSummary,
 };
 
 pub(crate) fn snapshot_markdown(snapshot: &Snapshot) -> String {
     let mut output = String::from("# PostgreSQL snapshot\n\n");
     output.push_str(&format!(
-        "- Source: {} / {} (database OID {})\n- PostgreSQL: {}\n- Server started: {}\n- System identifier: {}\n- Collection started: {}\n- Collection completed: {}\n- Collection duration: {} ms\n- Coverage: {}\n- Snapshot format: {}\n\n",
+        "- Source: {} / {} (database OID {})\n- PostgreSQL: {}\n- Server started: {}\n- System identifier: {}\n- Collection started: {}\n- Collection completed: {}\n- Collection duration: {} ms\n- Provenance: {}\n- Coverage: {}\n- Snapshot format: {}\n\n",
         escape(&snapshot.source.endpoint), escape(&snapshot.source.database), snapshot.source.database_oid,
         escape(&snapshot.source.server_version), snapshot.source.server_started_at.to_rfc3339(),
         optional(snapshot.source.system_identifier.as_deref()), snapshot.started_at.to_rfc3339(), snapshot.completed_at.to_rfc3339(),
         (snapshot.completed_at - snapshot.started_at).num_milliseconds(),
-        if snapshot.is_complete() { "complete" } else { "partial; inspect unavailable metrics and warnings" }, snapshot.schema_version,
+        if snapshot.is_synthetic() { "SYNTHETIC demo; no PostgreSQL connection" } else { "PostgreSQL observation" },
+        if snapshot.is_complete() { "complete collection; not a health verdict" } else { "partial; inspect unavailable metrics and warnings" }, snapshot.schema_version,
     ));
     warnings(&mut output, &snapshot.warnings);
     analysis_sections(&mut output, &diagnostics::analyze(snapshot, None));
@@ -116,7 +118,45 @@ pub(crate) fn snapshot_markdown(snapshot: &Snapshot) -> String {
 }
 
 pub(crate) fn comparison_markdown(comparison: &Comparison) -> String {
-    let mut output = String::from("# PostgreSQL snapshot comparison\n\n");
+    comparison_report(comparison, None)
+}
+
+pub(crate) fn comparison_with_captures_markdown(
+    comparison: &Comparison,
+    before: &SnapshotSummary,
+    after: &SnapshotSummary,
+) -> String {
+    comparison_report(comparison, Some((before, after)))
+}
+
+fn comparison_report(
+    comparison: &Comparison,
+    captures: Option<(&SnapshotSummary, &SnapshotSummary)>,
+) -> String {
+    let synthetic = [&comparison.source, &comparison.after_source]
+        .iter()
+        .any(|source| source.system_identifier.as_deref() == Some(SYNTHETIC_SYSTEM_IDENTIFIER));
+    let mut output = format!(
+        "# PostgreSQL snapshot comparison{}\n",
+        if synthetic { " · SYNTHETIC demo" } else { "" }
+    );
+    if let Some((before, after)) = captures {
+        output.push_str(&format!(
+            "- A: capture #{} — {}\n- B: capture #{} — {}\n",
+            before.id,
+            capture_label(&before.label),
+            after.id,
+            capture_label(&after.label)
+        ));
+    } else {
+        output.push_str(&format!(
+            "- A: {}\n- B: {}\n",
+            comparison.before.to_rfc3339(),
+            comparison.after.to_rfc3339()
+        ));
+    }
+    comparison_summary(&mut output, comparison);
+    output.push_str("\n## Source and compatibility\n\n");
     output.push_str(&format!("- Source: {} / {}\n- Before capture completed: {}\n- After capture completed: {}\n- Source compatibility: {}\n- Completion-to-completion interval: {} ms\n\n",
         escape(&comparison.source.endpoint), escape(&comparison.source.database), comparison.before.to_rfc3339(), comparison.after.to_rfc3339(),
         if comparison.source_compatible { "compatible (see identity warnings)" } else { "incompatible" }, number(comparison.interval_ms)));
@@ -212,6 +252,153 @@ pub(crate) fn comparison_markdown(comparison: &Comparison) -> String {
         }
     }
     output
+}
+
+fn capture_label(label: &str) -> String {
+    if label.is_empty() {
+        "Unlabelled".into()
+    } else {
+        escape(label)
+    }
+}
+
+fn comparison_summary(output: &mut String, comparison: &Comparison) {
+    let compatibility = if !comparison.source_compatible {
+        "INCOMPATIBLE; deltas unavailable"
+    } else if comparison.source.system_identifier.is_none()
+        || comparison.after_source.system_identifier.is_none()
+    {
+        "compatible via weaker identity; see caveats"
+    } else {
+        "compatible source"
+    };
+    let interval = comparison.interval_ms.map_or_else(
+        || "unavailable".into(),
+        |ms| format!("{:.3}s", ms as f64 / 1000.0),
+    );
+    output.push_str(&format!("- Interval: {interval} · {compatibility}\n"));
+    match &comparison.sessions {
+        Observation::Unavailable(reason) => {
+            output.push_str(&format!("- Sessions: unavailable ({})\n", escape(reason)))
+        }
+        Observation::Available(sessions) => {
+            output.push_str(&format!(
+                "- Sessions: +{} observed, -{} absent, {} changed; {} unknown identities\n",
+                sessions.added.len(),
+                sessions.removed.len(),
+                sessions.changed.len(),
+                sessions.unidentifiable_before.len() + sessions.unidentifiable_after.len()
+            ));
+            if !sessions.changed.is_empty() {
+                let pids = sessions
+                    .changed
+                    .iter()
+                    .take(3)
+                    .map(|change| change.identity.pid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!(
+                    "- Changed PIDs: {pids}{}; full fields in Session changes\n",
+                    if sessions.changed.len() > 3 {
+                        ", …"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+    }
+    match &comparison.blocking {
+        Observation::Unavailable(reason) => {
+            output.push_str(&format!("- Blocking: unavailable ({})\n", escape(reason)))
+        }
+        Observation::Available(blocking) => {
+            output.push_str(&format!(
+                "- Blocking: {} newly observed, {} resolved in observations, {} unresolved\n",
+                blocking.added.len(),
+                blocking.removed.len(),
+                blocking.unresolved_before.len() + blocking.unresolved_after.len()
+            ));
+        }
+    }
+    match &comparison.health.database {
+        Observation::Unavailable(_) => {
+            output.push_str("- Database changes: unavailable; see Database changes for reasons\n")
+        }
+        Observation::Available(database) => output.push_str(&format!(
+            "- Database: connections {} → {}; size change {} bytes\n",
+            database.connections_before,
+            database.connections_after,
+            observed(&database.size_delta_bytes)
+        )),
+    }
+    match &comparison.health.rates.database {
+        Observation::Unavailable(_) => output
+            .push_str("- Database interval: unavailable; see Database and WAL interval rates\n"),
+        Observation::Available(database) => output.push_str(&format!(
+            "- Database interval: deadlocks {}; temporary bytes {}\n",
+            compact_observed(&database.deadlocks),
+            compact_observed(&database.temp_bytes)
+        )),
+    }
+    match &comparison.statements {
+        Observation::Unavailable(_) => {
+            output.push_str("- Statement interval: unavailable; see Statement interval metrics\n")
+        }
+        Observation::Available(statements) => {
+            let valid = statements
+                .entries
+                .iter()
+                .filter_map(|entry| entry.delta.available().map(|delta| (entry, delta)))
+                .collect::<Vec<_>>();
+            if let Some((entry, delta)) = valid
+                .iter()
+                .max_by(|(_, left), (_, right)| left.total_exec_ms.total_cmp(&right.total_exec_ms))
+            {
+                output.push_str(&format!(
+                    "- Largest valid statement execution delta: query {} +{} ms / +{} calls\n",
+                    entry.identity.queryid,
+                    decimal(delta.total_exec_ms),
+                    delta.calls
+                ));
+            }
+            let unavailable = statements.entries.len() - valid.len();
+            if unavailable > 0 || statements.total.available().is_none() {
+                output.push_str(&format!("- Statement baseline: {} valid, {unavailable} unavailable entries; aggregate {}\n", valid.len(), if statements.total.available().is_some() { "available" } else { "unavailable" }));
+            } else if valid.is_empty() {
+                output.push_str("- Statement interval: no rows observed in either capture\n");
+            }
+        }
+    }
+    if let Observation::Available(relations) = &comparison.health.relations {
+        let largest = relations
+            .tables
+            .iter()
+            .filter_map(|table| {
+                table
+                    .size_delta_bytes
+                    .available()
+                    .map(|delta| (table, delta))
+            })
+            .filter(|(_, delta)| **delta != 0)
+            .max_by_key(|(_, delta)| delta.unsigned_abs());
+        if let Some((table, delta)) = largest {
+            output.push_str(&format!(
+                "- Largest observed table size change: OID {} {delta:+} bytes\n",
+                table.oid
+            ));
+        }
+    }
+    output.push_str(
+        "\nObserved changes do not establish a root-cause fix. Full evidence and caveats follow.\n",
+    );
+}
+
+fn compact_observed<T: std::fmt::Display>(value: &Observation<T>) -> String {
+    match value {
+        Observation::Available(value) => value.to_string(),
+        Observation::Unavailable(_) => "unavailable (see interval reasons)".into(),
+    }
 }
 
 pub(crate) fn analysis_markdown(analysis: &Analysis) -> String {
@@ -978,6 +1165,164 @@ mod investigation_tests {
     use super::*;
     use crate::compare::{compare, tests::snapshot};
     use chrono::Duration;
+
+    fn later(before: &Snapshot) -> Snapshot {
+        let mut after = before.clone();
+        after.started_at += Duration::seconds(10);
+        after.completed_at += Duration::seconds(10);
+        after
+    }
+
+    #[test]
+    fn comparison_leads_with_capture_identity_observed_changes_and_valid_metrics() {
+        let before = snapshot();
+        let mut after = later(&before);
+        if let Observation::Available(sessions) = &mut after.activity {
+            sessions[0].state = Some("idle".into());
+            sessions[0].query_age_ms = None;
+        }
+        if let Observation::Available(stats) = &mut after.statements {
+            stats.entries[0].calls += 2;
+            stats.entries[0].total_exec_ms += 120.0;
+        }
+        let metadata = |id, label: &str| SnapshotSummary {
+            id,
+            label: label.into(),
+            captured_at: before.completed_at,
+            source: "local fixture".into(),
+            complete: true,
+        };
+        let report = comparison_with_captures_markdown(
+            &compare(&before, &after),
+            &metadata(42, "Before change"),
+            &metadata(43, "After change"),
+        );
+        let summary = report.split("## Source and compatibility").next().unwrap();
+        assert!(summary.contains("A: capture #42 — Before change"));
+        assert!(summary.contains("B: capture #43 — After change"));
+        assert!(summary.contains("Interval: 10.000s · compatible source"));
+        assert!(summary.contains("1 changed"));
+        assert!(summary.contains("Changed PIDs: 123"));
+        assert!(summary.contains("Blocking: 0 newly observed, 0 resolved in observations"));
+        assert!(summary.contains("query 7 +120.000 ms / +2 calls"));
+        assert!(summary.lines().count() <= 16);
+        assert!(report.contains("## Session changes"));
+        assert!(report.contains("## Statement interval metrics"));
+        assert!(report.contains("| Calls | 10 | 12 | 2 |"));
+    }
+
+    #[test]
+    fn summary_never_promotes_reset_or_incompatible_deltas_to_valid_changes() {
+        let before = snapshot();
+        let mut after = later(&before);
+        if let Observation::Available(stats) = &mut after.statements {
+            stats.reset_at = Some(after.completed_at);
+            stats.entries[0].calls += 999;
+            stats.entries[0].total_exec_ms += 999.0;
+        }
+        if let Observation::Available(database) = &mut after.health.database {
+            database.stats_reset = Some(after.completed_at);
+        }
+        let report = comparison_markdown(&compare(&before, &after));
+        let summary = report.split("## Source and compatibility").next().unwrap();
+        assert!(summary.contains("Database interval: unavailable"));
+        assert!(summary.contains("Statement baseline: 0 valid, 1 unavailable"));
+        assert!(!summary.contains("Largest valid statement"));
+        after.source.database_oid += 1;
+        let report = comparison_markdown(&compare(&before, &after));
+        let summary = report.split("## Source and compatibility").next().unwrap();
+        assert!(summary.contains("INCOMPATIBLE; deltas unavailable"));
+        assert!(summary.contains("Sessions: unavailable"));
+        assert!(summary.contains("Blocking: unavailable"));
+        assert!(!summary.contains("0 newly observed"));
+        assert!(!summary.contains("Largest valid statement"));
+    }
+
+    #[test]
+    fn compact_comparison_first_screen_shows_capture_pair_and_supported_changes() {
+        let before = crate::demo::snapshot(0, false);
+        let mut after = crate::demo::snapshot(2, false);
+        after.started_at = before.started_at + Duration::seconds(10);
+        after.completed_at = before.completed_at + Duration::seconds(10);
+        let metadata = |id, label: &str| SnapshotSummary {
+            id,
+            label: label.into(),
+            captured_at: before.completed_at,
+            source: "synthetic-demo/demo_shop".into(),
+            complete: true,
+        };
+        let a = metadata(42, "Before change");
+        let b = metadata(43, "After change");
+        let mut app = crate::app::App::new(false);
+        app.set_snapshot(before.clone(), true);
+        app.capture = Some(a.clone());
+        app.tab = crate::app::Tab::History;
+        app.set_report(comparison_with_captures_markdown(
+            &compare(&before, &after),
+            &a,
+            &b,
+        ));
+        app.set_notice("Comparison ready".into());
+        for (width, height) in [(80, 24), (120, 36)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            for expected in [
+                "A: capture #42",
+                "B: capture #43",
+                "SYNTHETIC",
+                "Interval: 10.000s",
+                "Sessions:",
+                "Blocking:",
+                "Largest valid statement",
+            ] {
+                assert!(
+                    screen.contains(expected),
+                    "{width}x{height} first screen misses {expected}: {screen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_provenance_is_visible_before_comparison_changes() {
+        let before = crate::demo::snapshot(0, false);
+        let after = later(&before);
+        let report = comparison_markdown(&compare(&before, &after));
+        assert!(report.lines().next().unwrap().contains("SYNTHETIC demo"));
+        let mut incompatible = after;
+        incompatible.source.database_oid += 1;
+        let report = comparison_markdown(&compare(&before, &incompatible));
+        assert!(report.lines().next().unwrap().contains("SYNTHETIC demo"));
+    }
+
+    #[test]
+    fn capture_labels_are_escaped_in_the_comparison_summary() {
+        let before = snapshot();
+        let after = later(&before);
+        let capture = SnapshotSummary {
+            id: 9,
+            label: "before\n# forged <script>\u{1b}".into(),
+            captured_at: before.completed_at,
+            source: String::new(),
+            complete: true,
+        };
+        let report =
+            comparison_with_captures_markdown(&compare(&before, &after), &capture, &capture);
+        assert!(!report.contains("\n# forged"));
+        assert!(!report.contains("<script>"));
+        assert!(!report.contains('\u{1b}'));
+        assert!(report.contains("&lt;script&gt;"));
+    }
 
     #[test]
     fn analysis_export_contains_evidence_interpretation_steps_and_unknown_coverage() {

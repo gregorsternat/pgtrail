@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::{
     metrics::{self, IntervalMetrics},
-    model::{Observation, Session, Snapshot},
+    model::{Observation, SYNTHETIC_WARNING, Session, Snapshot},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -83,12 +83,19 @@ pub(crate) fn analyze(snapshot: &Snapshot, previous: Option<&Snapshot>) -> Analy
     {
         analysis.coverage.push("Relation ranking was truncated; absent tables or indexes are not proven absent from PostgreSQL".into());
     }
-    analysis.coverage.extend(snapshot.warnings.iter().cloned());
+    analysis.coverage.extend(
+        snapshot
+            .warnings
+            .iter()
+            .filter(|warning| *warning != SYNTHETIC_WARNING)
+            .cloned(),
+    );
     if let Some(before) = previous {
         analysis.coverage.extend(
             before
                 .warnings
                 .iter()
+                .filter(|warning| *warning != SYNTHETIC_WARNING)
                 .map(|warning| format!("Baseline capture: {warning}")),
         );
     }
@@ -107,34 +114,160 @@ pub(crate) fn analyze(snapshot: &Snapshot, previous: Option<&Snapshot>) -> Analy
     relation_findings(snapshot, &mut analysis.findings);
     replication_findings(snapshot, &mut analysis.findings);
     interval_findings(snapshot, previous, &analysis.rates, &mut analysis.findings);
-    availability(
-        &mut analysis.coverage,
-        "Database interval",
-        &analysis.rates.database,
-    );
+    interval_coverage(&mut analysis.coverage, &analysis.rates);
     if let Some(database) = analysis.rates.database.available() {
         analysis.coverage.push(database.baseline.clone());
-    }
-    availability(&mut analysis.coverage, "WAL interval", &analysis.rates.wal);
-    availability(
-        &mut analysis.coverage,
-        "Statement interval",
-        &analysis.rates.statements,
-    );
-    if let Observation::Available(entries) = &analysis.rates.statements {
-        let invalid = entries
-            .iter()
-            .filter(|entry| entry.calls_per_second.available().is_none())
-            .count();
-        if invalid > 0 {
-            analysis.coverage.push(format!("{invalid}/{} statement entries lack a valid interval baseline; inspect per-statement reasons", entries.len()));
-        }
     }
     analysis
         .findings
         .sort_by(|a, b| (a.severity, &a.id).cmp(&(b.severity, &b.id)));
+    // Put missing/restricted evidence and interval limitations ahead of the
+    // successful-section list, including when the first available section is large.
+    analysis
+        .coverage
+        .sort_by_key(|line| line.ends_with(": collected"));
+    analysis.coverage.insert(
+        0,
+        format!(
+            "Provenance: {}",
+            if snapshot.is_synthetic() {
+                "SYNTHETIC demo; no PostgreSQL connection"
+            } else {
+                "PostgreSQL observation"
+            }
+        ),
+    );
+    analysis.coverage.insert(1, collection_summary(snapshot));
+    analysis
+        .coverage
+        .insert(2, interval_summary(&analysis.rates));
     analysis.coverage.push("No finding is not proof of health. Findings use observed thresholds, not a validated capacity model or causal diagnosis. Captures are non-atomic and statistics may lag activity.".into());
     analysis
+}
+
+pub(crate) fn collection_summary(snapshot: &Snapshot) -> String {
+    let collected = snapshot.collected_sections();
+    format!(
+        "Collection: {collected}/8 sections; {}",
+        if collected < 8 {
+            format!("{} unavailable", 8 - collected)
+        } else if snapshot.is_complete() {
+            "complete collection (not a health verdict)".into()
+        } else {
+            "LIMITED; inspect restrictions and warnings".into()
+        }
+    )
+}
+
+pub(crate) fn interval_summary(rates: &IntervalMetrics) -> String {
+    let database = match &rates.database {
+        Observation::Unavailable(_) => "unavailable",
+        Observation::Available(database) => {
+            if database_metric_gaps(database).is_empty() {
+                "ready"
+            } else {
+                "partial"
+            }
+        }
+    };
+    let wal = match &rates.wal {
+        Observation::Unavailable(_) => "unavailable",
+        Observation::Available(wal) => {
+            if [
+                &wal.bytes_per_second,
+                &wal.records_per_second,
+                &wal.buffers_full_per_second,
+            ]
+            .iter()
+            .all(|metric| metric.available().is_some())
+            {
+                "ready"
+            } else {
+                "partial"
+            }
+        }
+    };
+    let statements = match &rates.statements {
+        Observation::Unavailable(_) => "unavailable",
+        Observation::Available(entries) if entries.is_empty() => "no rows",
+        Observation::Available(entries) => {
+            if entries
+                .iter()
+                .all(|entry| entry.calls_per_second.available().is_some())
+            {
+                "ready"
+            } else {
+                "partial"
+            }
+        }
+    };
+    format!("Intervals: DB {database} · WAL {wal} · SQL {statements}")
+}
+
+fn database_metric_gaps(database: &crate::metrics::DatabaseRates) -> Vec<(&'static str, &str)> {
+    [
+        ("commits/s", &database.commits_per_second),
+        ("rollbacks/s", &database.rollbacks_per_second),
+        ("transactions/s", &database.transactions_per_second),
+        ("rollback ratio", &database.rollback_percent),
+        ("reads/s", &database.reads_per_second),
+        ("hits/s", &database.hits_per_second),
+        ("cache hit ratio", &database.cache_hit_percent),
+        ("temporary bytes/s", &database.temp_bytes_per_second),
+        ("deadlocks/s", &database.deadlocks_per_second),
+        ("inserts/s", &database.inserted_per_second),
+        ("updates/s", &database.updated_per_second),
+        ("deletes/s", &database.deleted_per_second),
+        ("read time/s", &database.read_ms_per_second),
+        ("write time/s", &database.write_ms_per_second),
+    ]
+    .into_iter()
+    .filter_map(|(name, metric)| match metric {
+        Observation::Available(_) => None,
+        Observation::Unavailable(reason) => Some((name, reason.as_str())),
+    })
+    .collect()
+}
+
+fn interval_coverage(coverage: &mut Vec<String>, rates: &IntervalMetrics) {
+    match &rates.database {
+        Observation::Unavailable(reason) => {
+            coverage.push(format!("Database interval: unavailable ({reason})"))
+        }
+        Observation::Available(database) => {
+            for (name, reason) in database_metric_gaps(database) {
+                coverage.push(format!("Database interval {name}: unavailable ({reason})"));
+            }
+        }
+    }
+    match &rates.wal {
+        Observation::Unavailable(reason) => {
+            coverage.push(format!("WAL interval: unavailable ({reason})"))
+        }
+        Observation::Available(wal) => {
+            for (name, metric) in [
+                ("bytes/s", &wal.bytes_per_second),
+                ("records/s", &wal.records_per_second),
+                ("buffers full/s", &wal.buffers_full_per_second),
+            ] {
+                if let Observation::Unavailable(reason) = metric {
+                    coverage.push(format!("WAL interval {name}: unavailable ({reason})"));
+                }
+            }
+        }
+    }
+    match &rates.statements {
+        Observation::Unavailable(reason) => {
+            coverage.push(format!("Statement interval: unavailable ({reason})"))
+        }
+        Observation::Available(entries) => {
+            for entry in entries {
+                if let Observation::Unavailable(reason) = &entry.calls_per_second {
+                    coverage.push(format!("Statement interval query {}, user {}, database {}, top level {}: unavailable ({reason})", entry.identity.queryid, entry.identity.userid, entry.identity.dbid, entry.identity.toplevel));
+                }
+            }
+        }
+    }
 }
 
 fn availability<T>(coverage: &mut Vec<String>, name: &str, observation: &Observation<T>) {
@@ -618,6 +751,73 @@ mod tests {
             .iter()
             .map(|finding| finding.id.as_str())
             .collect()
+    }
+
+    #[test]
+    fn synthetic_provenance_does_not_hide_real_collection_or_interval_gaps() {
+        let mut snapshot = crate::demo::snapshot(0, false);
+        assert!(snapshot.is_synthetic());
+        assert!(snapshot.is_complete());
+        let analysis = analyze(&snapshot, None);
+        assert!(analysis.coverage[0].contains("SYNTHETIC"));
+        assert!(analysis.coverage[1].contains("8/8 sections; complete collection"));
+        assert!(analysis.coverage[2].contains("DB unavailable"));
+        assert!(
+            analysis
+                .coverage
+                .iter()
+                .any(|line| line.contains("A previous capture is required"))
+        );
+        snapshot
+            .warnings
+            .push("Session visibility is restricted".into());
+        assert!(!snapshot.is_complete());
+        assert!(collection_summary(&snapshot).contains("LIMITED"));
+        snapshot.warnings.pop();
+        snapshot.health.io = Observation::Unavailable("restricted role".into());
+        assert!(!snapshot.is_complete());
+        let analysis = analyze(&snapshot, None);
+        let unavailable = analysis
+            .coverage
+            .iter()
+            .position(|line| line.contains("I/O: unavailable (restricted role)"))
+            .unwrap();
+        let success = analysis
+            .coverage
+            .iter()
+            .position(|line| line.ends_with(": collected"))
+            .unwrap();
+        assert!(unavailable < success);
+        assert!(analysis.coverage[1].contains("7/8 sections; 1 unavailable"));
+    }
+
+    #[test]
+    fn interval_readiness_is_partial_when_individual_counters_are_invalid() {
+        let before = snapshot();
+        let mut after = before.clone();
+        after.started_at += Duration::seconds(10);
+        after.completed_at += Duration::seconds(10);
+        if let Observation::Available(db) = &mut after.health.database {
+            db.deadlocks = -1;
+        }
+        let analysis = analyze(&after, Some(&before));
+        assert!(interval_summary(&analysis.rates).contains("DB partial"));
+        assert!(
+            analysis
+                .coverage
+                .iter()
+                .any(|line| line.contains("Database interval deadlocks/s: unavailable"))
+        );
+        assert!(
+            analysis
+                .rates
+                .database
+                .available()
+                .unwrap()
+                .deadlocks
+                .available()
+                .is_none()
+        );
     }
 
     #[test]

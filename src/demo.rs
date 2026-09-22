@@ -2,7 +2,8 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::model::{
-    Observation, SNAPSHOT_VERSION, Session, Snapshot, Source, Statement, StatementStats,
+    Observation, SNAPSHOT_VERSION, SYNTHETIC_SYSTEM_IDENTIFIER, SYNTHETIC_WARNING, Session,
+    Snapshot, Source, Statement, StatementStats,
 };
 
 pub(crate) fn snapshot(sequence: u64, include_query_text: bool) -> Snapshot {
@@ -134,7 +135,7 @@ pub(crate) fn snapshot(sequence: u64, include_query_text: bool) -> Snapshot {
             database_oid: 16384,
             server_version: "18 (synthetic demo)".into(),
             server_started_at: origin,
-            system_identifier: Some("pgtrail-demo-v1".into()),
+            system_identifier: Some(SYNTHETIC_SYSTEM_IDENTIFIER.into()),
         },
         activity: Observation::Available(activity),
         statements: Observation::Available(StatementStats {
@@ -143,7 +144,7 @@ pub(crate) fn snapshot(sequence: u64, include_query_text: bool) -> Snapshot {
             truncated: false,
             entries,
         }),
-        warnings: vec!["Synthetic demo data; no PostgreSQL connection is open.".into()],
+        warnings: vec![SYNTHETIC_WARNING.into()],
     }
 }
 

@@ -1,5 +1,63 @@
 //! Portable incident reports retain observations, notes and conservative comparisons.
 use crate::{compare, diagnostics, model::Snapshot, report, store::Incident};
+use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TimelineId {
+    Capture(i64),
+    Note(DateTime<Utc>, usize),
+}
+
+pub(crate) struct TimelineEntry {
+    pub(crate) id: TimelineId,
+    pub(crate) at: DateTime<Utc>,
+    pub(crate) title: String,
+    pub(crate) detail: String,
+    pub(crate) capture_id: Option<i64>,
+}
+
+/// Full chronology shared by navigation and rendering; no captured payload I/O.
+pub(crate) fn timeline(incident: &Incident) -> Vec<TimelineEntry> {
+    let mut entries: Vec<_> = incident
+        .captures
+        .iter()
+        .map(|capture| TimelineEntry {
+            id: TimelineId::Capture(capture.id),
+            at: capture.captured_at,
+            title: format!("Capture #{}: {}", capture.id, capture.label),
+            detail: format!(
+                "Capture #{}: {}\nObserved: {}\nSource: {}\nCollection: {}\n{}\nEnter: inspect this capture offline. Esc returns to this chronology.",
+                capture.id,
+                capture.label,
+                capture.captured_at.to_rfc3339(),
+                capture.source,
+                if capture.complete { "complete (not a health verdict)" } else { "partial; inspect coverage in the capture" },
+                incident.capture_notes.get(&capture.id).map(|note| format!("Annotation: {note}")).unwrap_or_default(),
+            ),
+            capture_id: Some(capture.id),
+        })
+        .collect();
+    let mut occurrences = BTreeMap::new();
+    for note in &incident.notes {
+        let occurrence = occurrences.entry(note.created_at).or_insert(0_usize);
+        entries.push(TimelineEntry {
+            id: TimelineId::Note(note.created_at, *occurrence),
+            at: note.created_at,
+            title: format!("Note: {}", note.text),
+            detail: format!(
+                "Operator note · {}\n\n{}",
+                note.created_at.to_rfc3339(),
+                note.text
+            ),
+            capture_id: None,
+        });
+        *occurrence += 1;
+    }
+    // Stable sorting retains insertion order for notes with equal timestamps.
+    entries.sort_by_key(|entry| (entry.at, entry.capture_id.is_none()));
+    entries
+}
 
 pub(crate) fn markdown(incident: &Incident, captures: &[(i64, Snapshot)]) -> String {
     let summary = &incident.summary;
@@ -196,6 +254,56 @@ mod tests {
         store::{IncidentNote, IncidentSummary, SnapshotSummary},
     };
     use chrono::Duration;
+
+    #[test]
+    fn timeline_contains_old_events_full_notes_and_stable_capture_identity() {
+        let before = snapshot();
+        let mut incident = Incident {
+            summary: IncidentSummary {
+                id: 1,
+                title: "Incident".into(),
+                created_at: before.completed_at,
+                closed_at: None,
+                capture_count: 7,
+                note_count: 8,
+            },
+            notes: (0..8)
+                .map(|i| IncidentNote {
+                    created_at: before.completed_at + Duration::seconds(i),
+                    text: format!("Note {i}: {}END", "long note ".repeat(200)),
+                })
+                .collect(),
+            captures: (1..=7)
+                .rev()
+                .map(|id| SnapshotSummary {
+                    id,
+                    label: format!("capture {id}"),
+                    captured_at: before.completed_at + Duration::seconds(id),
+                    source: "local".into(),
+                    complete: true,
+                })
+                .collect(),
+            capture_notes: [(1, "Original context".into())].into_iter().collect(),
+        };
+        let entries = timeline(&incident);
+        assert_eq!(entries.len(), 15);
+        assert!(entries.windows(2).all(|pair| pair[0].at <= pair[1].at));
+        assert!(entries[0].detail.ends_with("END"));
+        let capture = entries
+            .iter()
+            .find(|entry| entry.capture_id == Some(1))
+            .unwrap();
+        assert_eq!(capture.id, TimelineId::Capture(1));
+        assert!(capture.detail.contains("Original context"));
+        let note_id = entries[0].id.clone();
+        incident.captures.reverse();
+        incident.notes.push(IncidentNote {
+            created_at: before.completed_at,
+            text: "Equal timestamp".into(),
+        });
+        assert_eq!(timeline(&incident)[0].id, note_id);
+        assert_ne!(timeline(&incident)[1].id, note_id);
+    }
 
     #[test]
     fn report_orders_evidence_links_comparison_and_explains_restart() {

@@ -1,3 +1,7 @@
+#[cfg(test)]
+mod incident_tests;
+mod navigation;
+
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::VecDeque;
@@ -23,6 +27,7 @@ pub(crate) enum Action {
     CloseIncident(i64, bool),
     AttachCapture(i64, i64),
     LabelCapture(i64, String),
+    ExportIncident(i64, bool, String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -97,6 +102,7 @@ pub(crate) enum PromptKind {
     Incident,
     Note(i64),
     Label(i64),
+    ExportIncident(i64, bool),
 }
 
 #[derive(Debug)]
@@ -122,6 +128,13 @@ pub(crate) struct App {
     offline: bool,
     selected: [usize; 10],
     filter_before_edit: String,
+    filters: [String; 10],
+    navigation: Vec<navigation::Location>,
+    pub(crate) help_scroll: usize,
+    pub(crate) viewport_width: u16,
+    pub(crate) viewport_height: u16,
+    pub(crate) capture: Option<SnapshotSummary>,
+    pub(crate) pending_capture_request: Option<u64>,
     pub(crate) demo: bool,
     pub(crate) tab: Tab,
     pub(crate) filter: String,
@@ -149,6 +162,8 @@ pub(crate) struct App {
     pub(crate) incident: Option<crate::store::Incident>,
     pub(crate) active_incident: Option<i64>,
     pub(crate) prompt: Option<Prompt>,
+    pub(crate) incident_timeline: bool,
+    pub(crate) incident_cursor: usize,
 }
 
 impl App {
@@ -160,6 +175,13 @@ impl App {
             offline: false,
             selected: [0; 10],
             filter_before_edit: String::new(),
+            filters: std::array::from_fn(|_| String::new()),
+            navigation: Vec::new(),
+            help_scroll: 0,
+            viewport_width: 120,
+            viewport_height: 36,
+            capture: None,
+            pending_capture_request: None,
             demo,
             tab: Tab::Overview,
             filter: String::new(),
@@ -187,6 +209,8 @@ impl App {
             incident: None,
             active_incident: None,
             prompt: None,
+            incident_timeline: false,
+            incident_cursor: 0,
         }
     }
 
@@ -197,7 +221,7 @@ impl App {
         self.paused
     }
     pub(crate) fn is_offline(&self) -> bool {
-        self.offline || self.report.is_some()
+        self.offline || self.report.is_some() || !self.navigation.is_empty()
     }
     pub(crate) fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
@@ -207,7 +231,13 @@ impl App {
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: Snapshot, offline: bool) {
+        let identities = self.selection_identities();
+        let same_source = self
+            .snapshot
+            .as_ref()
+            .is_none_or(|old| crate::compare::sources_compatible(&old.source, &snapshot.source));
         if !offline {
+            self.capture = None;
             let is_new = self.live_current.as_ref().is_none_or(|old| {
                 old.completed_at != snapshot.completed_at || old.source != snapshot.source
             });
@@ -255,14 +285,18 @@ impl App {
         self.snapshot = Some(snapshot);
         self.offline = offline;
         if offline {
+            self.filters[self.tab.index()] = self.filter.clone();
             self.tab = Tab::Overview;
-            self.filter.clear();
+            self.filter = self.filters[Tab::Overview.index()].clone();
             self.selected = [0; 10];
             self.report = None;
         }
         self.loading = false;
         self.error = None;
         self.now = Utc::now();
+        if !offline {
+            self.restore_identities(identities, same_source);
+        }
         self.clamp_selection();
     }
 
@@ -327,6 +361,9 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) -> Option<Action> {
+        if let Some(request) = self.pending_capture_request {
+            self.discard_pending_capture_return(request);
+        }
         if self.prompt.is_some() {
             return self.edit_prompt(key);
         }
@@ -344,13 +381,32 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => self.help = false,
                 KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10),
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => self.help_scroll = usize::MAX,
                 _ => {}
             }
+            let (width, height) =
+                crate::ui::help_dimensions(self.viewport_width, self.viewport_height);
+            let count = crate::ui::help_lines(width.saturating_sub(2)).len();
+            self.help_scroll = self
+                .help_scroll
+                .min(count.saturating_sub(usize::from(height.saturating_sub(2))));
             return None;
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Tab | KeyCode::Right => return self.switch_tab((self.tab.index() + 1) % 10),
             KeyCode::BackTab | KeyCode::Left => {
                 return self.switch_tab((self.tab.index() + 9) % 10);
@@ -367,9 +423,52 @@ impl App {
             KeyCode::PageUp => self.move_selection(-10),
             KeyCode::Home | KeyCode::Char('g') => self.move_selection(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.move_selection(isize::MAX),
-            KeyCode::Char('/') => {
+            KeyCode::Char('/') if self.filter_available() && self.report.is_none() => {
                 self.editing_filter = true;
                 self.filter_before_edit = self.filter.clone();
+            }
+            KeyCode::Backspace => return self.return_to_origin(),
+            KeyCode::Char('t')
+                if self.tab == Tab::Incidents
+                    && self.incident.is_some()
+                    && self.report.is_none() =>
+            {
+                self.incident_timeline = !self.incident_timeline
+            }
+            KeyCode::Char('e' | 'E') if self.tab == Tab::Incidents => {
+                let id = if self.incident_timeline {
+                    self.incident.as_ref().map(|v| v.summary.id)
+                } else {
+                    self.filtered_incidents().get(self.selected()).map(|v| v.id)
+                };
+                if let Some(id) = id {
+                    self.prompt = Some(Prompt {
+                        kind: PromptKind::ExportIncident(id, key.code == KeyCode::Char('E')),
+                        value: String::new(),
+                    });
+                }
+            }
+            KeyCode::Char('e') if self.tab != Tab::Incidents => self.follow_evidence(),
+            KeyCode::Char('w') if matches!(self.tab, Tab::Activity | Tab::Blocking) => {
+                self.follow_session(false)
+            }
+            KeyCode::Char('b') if matches!(self.tab, Tab::Activity | Tab::Blocking) => {
+                self.follow_session(true)
+            }
+            KeyCode::Char('[') if self.report.is_some() => self.report_section(false),
+            KeyCode::Char(']') if self.report.is_some() => self.report_section(true),
+            KeyCode::Char('h') if self.analysis.is_some() => self.open_coverage(),
+            KeyCode::Enter
+                if self.report.is_none()
+                    && matches!(
+                        self.tab,
+                        Tab::Activity | Tab::Blocking | Tab::Statements | Tab::Relations
+                    ) =>
+            {
+                if let Some((title, text)) = crate::ui::detail_report(self) {
+                    self.set_report(text);
+                    self.report_title = title;
+                }
             }
             KeyCode::Char('i') => {
                 self.prompt = Some(Prompt {
@@ -388,7 +487,12 @@ impl App {
                 self.notice = Some("New captures will not be attached to an incident.".into());
             }
             KeyCode::Char('o') if self.tab == Tab::Incidents => {
-                if let Some(incident) = self.filtered_incidents().get(self.selected()) {
+                let summary = if self.incident_timeline {
+                    self.incident.as_ref().map(|v| &v.summary)
+                } else {
+                    self.filtered_incidents().get(self.selected()).copied()
+                };
+                if let Some(incident) = summary {
                     return Some(Action::CloseIncident(
                         incident.id,
                         incident.closed_at.is_none(),
@@ -421,7 +525,25 @@ impl App {
                     self.report_title = "Coverage and limits";
                 }
             }
-            KeyCode::Enter if self.tab == Tab::Incidents => {
+            KeyCode::Enter
+                if self.tab == Tab::Incidents
+                    && self.incident_timeline
+                    && self.report.is_none() =>
+            {
+                if let Some(entry) = self.incident.as_ref().and_then(|v| {
+                    crate::incidents::timeline(v)
+                        .into_iter()
+                        .nth(self.incident_cursor)
+                }) {
+                    if let Some(id) = entry.capture_id {
+                        self.remember_location();
+                        return Some(Action::Load(id));
+                    }
+                    self.set_report(format!("# Operator note\n\n{}", entry.detail));
+                    self.report_title = "Incident note";
+                }
+            }
+            KeyCode::Enter if self.tab == Tab::Incidents && self.report.is_none() => {
                 if let Some(incident) = self.filtered_incidents().get(self.selected()) {
                     return Some(Action::SelectIncident(incident.id));
                 }
@@ -510,16 +632,21 @@ impl App {
             KeyCode::Esc if self.report.is_some() => {
                 self.report = None;
                 self.report_scroll = 0;
-                if !self.offline {
+                if !self.is_offline() {
                     return Some(Action::ResumeLive);
                 }
             }
+            KeyCode::Esc if self.tab == Tab::Incidents && self.incident_timeline => {
+                self.incident_timeline = false;
+            }
+            KeyCode::Esc if !self.navigation.is_empty() => return self.return_to_origin(),
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
-                self.selected = [0; 10];
+                self.selected[self.tab.index()] = 0;
             }
             KeyCode::Esc if self.offline => {
                 self.offline = false;
+                self.capture = None;
                 self.snapshot = None;
                 self.analysis = None;
                 self.notice = Some("Returned to live monitoring.".into());
@@ -534,8 +661,11 @@ impl App {
     }
 
     fn switch_tab(&mut self, index: usize) -> Option<Action> {
-        let resume_live = self.report.is_some() && !self.offline;
+        let resume_live = (self.report.is_some() || !self.navigation.is_empty()) && !self.offline;
+        self.navigation.clear();
+        self.filters[self.tab.index()] = self.filter.clone();
         self.tab = Tab::ALL[index];
+        self.filter = self.filters[self.tab.index()].clone();
         self.report = None;
         self.clamp_selection();
         if resume_live {
@@ -572,15 +702,24 @@ impl App {
             }
             _ => {}
         }
-        self.selected = [0; 10];
+        self.selected[self.tab.index()] = 0;
     }
 
     fn move_selection(&mut self, movement: isize) {
-        if let Some(report) = &self.report {
+        if self.report.is_some() {
             self.report_scroll = self
                 .report_scroll
                 .saturating_add_signed(movement)
-                .min(report.lines().count().saturating_sub(1));
+                .min(self.max_report_scroll());
+        } else if self.tab == Tab::Incidents && self.incident_timeline {
+            let count = self
+                .incident
+                .as_ref()
+                .map_or(0, |v| crate::incidents::timeline(v).len());
+            self.incident_cursor = self
+                .incident_cursor
+                .saturating_add_signed(movement)
+                .min(count.saturating_sub(1));
         } else {
             self.selected[self.tab.index()] = self.selected().saturating_add_signed(movement);
             self.clamp_selection();
@@ -620,16 +759,19 @@ impl App {
             .into_iter()
             .flatten()
             .filter(|session| {
-                self.matches(&format!(
-                    "{} {} {} {} {} {} {}",
-                    session.pid,
-                    session.user.as_deref().unwrap_or_default(),
-                    session.application,
-                    session.state.as_deref().unwrap_or_default(),
-                    session.wait_event.as_deref().unwrap_or_default(),
-                    session.database.as_deref().unwrap_or_default(),
-                    session.query.as_deref().unwrap_or_default()
-                ))
+                self.matches(
+                    Tab::Activity,
+                    &format!(
+                        "{} {} {} {} {} {} {}",
+                        session.pid,
+                        session.user.as_deref().unwrap_or_default(),
+                        session.application,
+                        session.state.as_deref().unwrap_or_default(),
+                        session.wait_event.as_deref().unwrap_or_default(),
+                        session.database.as_deref().unwrap_or_default(),
+                        session.query.as_deref().unwrap_or_default()
+                    ),
+                )
             })
             .collect();
         sessions.sort_by(|a, b| {
@@ -653,13 +795,16 @@ impl App {
                     .map(move |blocker| (session, *blocker))
             })
             .filter(|(session, blocker)| {
-                self.matches(&format!(
-                    "{} {} {} {}",
-                    session.pid,
-                    blocker,
-                    session.application,
-                    session.user.as_deref().unwrap_or_default()
-                ))
+                self.matches(
+                    Tab::Blocking,
+                    &format!(
+                        "{} {} {} {}",
+                        session.pid,
+                        blocker,
+                        session.application,
+                        session.user.as_deref().unwrap_or_default()
+                    ),
+                )
             })
             .collect()
     }
@@ -672,13 +817,16 @@ impl App {
             .into_iter()
             .flat_map(|s| &s.entries)
             .filter(|s| {
-                self.matches(&format!(
-                    "{} {} {} {}",
-                    s.queryid,
-                    s.userid,
-                    s.dbid,
-                    s.query.as_deref().unwrap_or_default()
-                ))
+                self.matches(
+                    Tab::Statements,
+                    &format!(
+                        "{} {} {} {}",
+                        s.queryid,
+                        s.userid,
+                        s.dbid,
+                        s.query.as_deref().unwrap_or_default()
+                    ),
+                )
             })
             .collect();
         statements.sort_by(|a, b| {
@@ -697,12 +845,17 @@ impl App {
     pub(crate) fn filtered_history(&self) -> Vec<&SnapshotSummary> {
         self.history
             .iter()
-            .filter(|s| self.matches(&format!("{} {} {}", s.id, s.label, s.source)))
+            .filter(|s| self.matches(Tab::History, &format!("{} {} {}", s.id, s.label, s.source)))
             .collect()
     }
 
-    fn matches(&self, value: &str) -> bool {
-        value.to_lowercase().contains(&self.filter.to_lowercase())
+    fn matches(&self, tab: Tab, value: &str) -> bool {
+        let filter = if tab == self.tab {
+            &self.filter
+        } else {
+            &self.filters[tab.index()]
+        };
+        value.to_lowercase().contains(&filter.to_lowercase())
     }
     fn edit_prompt(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
@@ -717,6 +870,9 @@ impl App {
                     PromptKind::Incident => Action::CreateIncident(prompt.value),
                     PromptKind::Note(id) => Action::NoteIncident(id, prompt.value),
                     PromptKind::Label(id) => Action::LabelCapture(id, prompt.value),
+                    PromptKind::ExportIncident(id, json) => {
+                        Action::ExportIncident(id, json, prompt.value)
+                    }
                 });
             }
             KeyCode::Backspace => {
@@ -736,7 +892,10 @@ impl App {
                     ) =>
             {
                 if let Some(prompt) = &mut self.prompt {
-                    let limit = if matches!(prompt.kind, PromptKind::Note(_)) {
+                    let limit = if matches!(
+                        prompt.kind,
+                        PromptKind::Note(_) | PromptKind::ExportIncident(_, _)
+                    ) {
                         4000
                     } else {
                         200
@@ -778,18 +937,37 @@ impl App {
             .is_none()
             .then_some(incident.summary.id);
         self.incident = Some(incident);
+        self.incident_timeline = true;
+        self.incident_cursor = 0;
+    }
+    pub(crate) fn update_incident(&mut self, incident: crate::store::Incident) {
+        let identity = self.incident.as_ref().and_then(|v| {
+            crate::incidents::timeline(v)
+                .get(self.incident_cursor)
+                .map(|e| e.id.clone())
+        });
+        let entries = crate::incidents::timeline(&incident);
+        self.incident_cursor = identity
+            .and_then(|id| entries.iter().position(|v| v.id == id))
+            .unwrap_or(0);
+        self.incident = Some(incident);
     }
     pub(crate) fn filtered_incidents(&self) -> Vec<&crate::store::IncidentSummary> {
         self.incidents
             .iter()
-            .filter(|v| self.matches(&format!("{} {}", v.id, v.title)))
+            .filter(|v| self.matches(Tab::Incidents, &format!("{} {}", v.id, v.title)))
             .collect()
     }
     pub(crate) fn filtered_findings(&self) -> Vec<&crate::diagnostics::Finding> {
         self.analysis
             .iter()
             .flat_map(|a| &a.findings)
-            .filter(|f| self.matches(&format!("{} {} {}", f.id, f.title, f.evidence.join(" "))))
+            .filter(|f| {
+                self.matches(
+                    Tab::Overview,
+                    &format!("{} {} {}", f.id, f.title, f.evidence.join(" ")),
+                )
+            })
             .collect()
     }
     pub(crate) fn filtered_tables(&self) -> Vec<&crate::model::TableStats> {
@@ -798,7 +976,12 @@ impl App {
             .iter()
             .filter_map(|s| s.health.tables.available())
             .flat_map(|r| &r.tables)
-            .filter(|t| self.matches(&format!("{} {} {}", t.oid, t.schema, t.name)))
+            .filter(|t| {
+                self.matches(
+                    Tab::Relations,
+                    &format!("{} {} {}", t.oid, t.schema, t.name),
+                )
+            })
             .collect();
         rows.sort_by(|a, b| {
             match self.relation_sort {
@@ -816,7 +999,12 @@ impl App {
             .iter()
             .filter_map(|s| s.health.tables.available())
             .flat_map(|r| &r.indexes)
-            .filter(|t| self.matches(&format!("{} {} {} {}", t.oid, t.schema, t.table, t.name)))
+            .filter(|t| {
+                self.matches(
+                    Tab::Relations,
+                    &format!("{} {} {} {}", t.oid, t.schema, t.table, t.name),
+                )
+            })
             .collect();
         rows.sort_by(|a, b| {
             match self.relation_sort {
@@ -835,10 +1023,18 @@ impl App {
             .filter_map(|a| a.rates.statements.available())
             .flatten()
             .filter(|r| {
-                self.matches(&format!(
-                    "{} {} {}",
-                    r.identity.queryid, r.identity.userid, r.identity.dbid
-                ))
+                self.matches(
+                    Tab::Statements,
+                    &format!(
+                        "{} {} {} {}",
+                        r.identity.queryid,
+                        r.identity.userid,
+                        r.identity.dbid,
+                        self.statement_for_identity(&r.identity)
+                            .and_then(|s| s.query.as_deref())
+                            .unwrap_or_default()
+                    ),
+                )
             })
             .collect();
         let metric = |r: &crate::metrics::StatementRate| match self.sort {
@@ -934,13 +1130,14 @@ mod tests {
         let mut app = App::new(true);
         app.set_history(history());
         key(&mut app, KeyCode::Char('5'));
-        app.set_report("first\nsecond\nthird".into());
+        app.set_report(format!("{}last", "line\n".repeat(80)));
         key(&mut app, KeyCode::End);
-        assert_eq!(app.report_scroll, 2);
+        let scroll = app.report_scroll;
+        assert!(scroll > 0);
         assert_eq!(app.selected(), 0);
         key(&mut app, KeyCode::Char('?'));
         key(&mut app, KeyCode::Down);
-        assert_eq!(app.report_scroll, 2);
+        assert_eq!(app.report_scroll, scroll);
         key(&mut app, KeyCode::Esc);
         assert!(!app.help);
         assert!(app.report.is_some());

@@ -226,6 +226,41 @@ fn write_output(output: &str, path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+async fn incident_output(store: &Store, id: i64, format: Format) -> Result<String> {
+    let incident = store.incident(id).await?;
+    let mut captures = Vec::new();
+    for capture in &incident.captures {
+        captures.push((capture.id, store.load(capture.id).await?));
+    }
+    match format {
+        Format::Markdown => Ok(crate::incidents::markdown(&incident, &captures)),
+        Format::Json => Ok(serde_json::to_string_pretty(
+            &serde_json::json!({"incident": incident, "captures": captures}),
+        )?),
+    }
+}
+
+/// The TUI uses the same report and private, create-new export writer as the CLI.
+/// File writes run outside the async event loop, including slow filesystem flushes.
+pub(crate) async fn export_incident(
+    store_path: &Path,
+    id: i64,
+    json: bool,
+    destination: &Path,
+) -> Result<()> {
+    let store = Store::open(store_path).await?;
+    let output = incident_output(
+        &store,
+        id,
+        if json { Format::Json } else { Format::Markdown },
+    )
+    .await?;
+    let destination = destination.to_owned();
+    tokio::task::spawn_blocking(move || write_output(&output, Some(&destination)))
+        .await
+        .context("export worker stopped unexpectedly")?
+}
+
 async fn incident_command(cli: &Cli, command: &IncidentCommand) -> Result<()> {
     let store = Store::open(&cli.store_path()?).await?;
     match command {
@@ -259,14 +294,8 @@ async fn incident_command(cli: &Cli, command: &IncidentCommand) -> Result<()> {
             write_output(&text, None)
         }
         IncidentCommand::Show { id, format, output } => {
-            let incident = store.incident(*id).await?;
-            let mut captures = Vec::new();
-            for capture in &incident.captures {
-                captures.push((capture.id, store.load(capture.id).await?));
-            }
-            let markdown = crate::incidents::markdown(&incident, &captures);
-            let payload = serde_json::json!({"incident": incident, "captures": captures});
-            emit(&payload, markdown, *format, output.as_deref())
+            let report = incident_output(&store, *id, *format).await?;
+            write_output(&report, output.as_deref())
         }
         IncidentCommand::Note { id, text } => {
             store.add_note(*id, text).await?;
@@ -397,4 +426,88 @@ async fn record(cli: &Cli, count: u32, interval: u64, label: &str) -> Result<()>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tui_incident_exports_match_cli_reports_and_keep_all_notes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("history.sqlite3");
+        let store = Store::open(&store_path).await?;
+        let id = store.create_incident("Queue incident").await?;
+        for index in 0..8 {
+            store.add_note(id, &format!("Observation {index}")).await?;
+        }
+        let capture = store
+            .save_for_incident(&crate::demo::snapshot(0, false), "Before change", Some(id))
+            .await?;
+        let markdown_path = temp.path().join("incident.md");
+        let json_path = temp.path().join("incident.json");
+        export_incident(&store_path, id, false, &markdown_path).await?;
+        export_incident(&store_path, id, true, &json_path).await?;
+        assert_eq!(
+            std::fs::read_to_string(&markdown_path)?,
+            incident_output(&store, id, Format::Markdown).await?
+        );
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json_path)?)?;
+        assert_eq!(json["incident"]["notes"].as_array().unwrap().len(), 8);
+        assert_eq!(json["captures"][0][0], capture);
+        assert!(std::fs::read_to_string(&markdown_path)?.contains("Observation 0"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&markdown_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&json_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tui_export_never_overwrites_and_failed_reads_create_no_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("history.sqlite3");
+        let store = Store::open(&store_path).await?;
+        let id = store.create_incident("Queue incident").await?;
+        let existing = temp.path().join("existing.md");
+        std::fs::write(&existing, "retain original")?;
+        assert!(
+            export_incident(&store_path, id, false, &existing)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&existing)?, "retain original");
+        let missing = temp.path().join("missing.md");
+        assert!(
+            export_incident(&store_path, id + 1, false, &missing)
+                .await
+                .is_err()
+        );
+        assert!(!missing.exists());
+        assert!(
+            export_incident(&store_path, id, false, temp.path())
+                .await
+                .is_err()
+        );
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("link.md");
+            std::os::unix::fs::symlink(&existing, &link)?;
+            assert!(
+                export_incident(&store_path, id, false, &link)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&existing)?, "retain original");
+        }
+        Ok(())
+    }
 }
