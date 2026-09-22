@@ -9,7 +9,7 @@ install your distribution's native build tools. `just` and Docker are optional f
 Rust-only work; PostgreSQL fixture checks require a running Docker engine.
 
 Use a focused branch (the maintainer's default prefix is `gregorsternat/`). Choose
-one roadmap slice or fix, read the relevant architecture section, and keep unrelated
+one coherent feature or fix, read the relevant architecture section, and keep unrelated
 changes separate. Do not add a dependency or abstraction without a present use.
 
 ## Rust practices
@@ -33,7 +33,7 @@ Test behavior and useful failure modes; no coverage percentage is required.
 
 For terminal changes, also verify in an actual interactive terminal:
 
-1. Run `cargo run --locked` and check the current capability message.
+1. Run `cargo run --locked -- --demo`; inspect all five views and keyboard help.
 2. Resize the terminal, including a narrow window; the UI must remain responsive.
 3. Quit with `q`; the prompt and cursor must return normally.
 4. Run again and quit with `Ctrl+C`; check that typed shell input still echoes.
@@ -46,8 +46,16 @@ read-write transaction. It must never accept an arbitrary production DSN.
 
 The fixture initializes only on an empty volume. Recreate the disposable development
 volume when changing initialization SQL; `just db-down` intentionally preserves it.
-Future collector integration tests belong in a separate explicitly invoked suite
-so ordinary `cargo test --locked` continues to run without PostgreSQL.
+Run collector integration tests separately against this fixture:
+
+```sh
+PGTRAIL_LIVE_TEST=1 cargo test --locked --lib -- --ignored --test-threads=1
+```
+
+These tests are gated against the disposable Compose database. They exercise
+real monitoring, lock contention/unblocking, and failure paths. Ordinary
+`cargo test --locked` runs without PostgreSQL. Also try capturing two observations,
+restarting the TUI, loading a saved observation, and comparing the two in History.
 
 ## Documentation and review
 
@@ -62,5 +70,5 @@ PR descriptions explain the concrete problem, resulting behavior, and checks run
 Report unavailable checks honestly; a local success is not a verified CI run.
 
 CI runs on pull requests and pushes to `main`. Dependency update PRs are generated
-weekly for Cargo and GitHub Actions. Actions are pinned by commit. This foundation
+weekly for Cargo and GitHub Actions. Actions are pinned by commit. CI
 does not publish to crates.io or create release binaries automatically.

@@ -1,76 +1,106 @@
 # Architecture
 
-## Implemented foundation
+pgtrail is one Rust 2024 package, with a thin binary entry point and an internal
+library. Rust 1.98.1 is pinned; `Cargo.lock` is committed. Runtime dependencies are
+used for implemented capabilities: Tokio, SQLx 0.9 with PostgreSQL/SQLite and
+Rustls, Ratatui 0.30/Crossterm, Clap, Chrono, Serde, and contextual/typed errors.
+Only the application runner is public. There is no SDK, plugin system, or web server.
 
-pgtrail is one Cargo package with a binary entry point and a small internal library.
-It uses Rust 2024, a pinned stable toolchain, and a committed lockfile. The declared
-minimum Rust version matches the pinned version; older compilers are not promised.
-The initial targets are Linux and macOS.
+## Data flow
 
-| Responsibility | Location | Boundary |
-| --- | --- | --- |
-| Runtime entry | `src/main.rs` | Starts the Tokio current-thread runtime |
-| Orchestration | `src/lib.rs` | Parses arguments and drives draw/event/update |
-| Arguments | `src/cli.rs` | Clap help and version, no connection options yet |
-| State | `src/app.rs` | Pure state transitions from messages |
-| Input | `src/event.rs` | Crossterm stream and interrupt signal to messages |
-| Terminal lifetime | `src/terminal.rs` | Interactive check, setup, restoration |
-| Rendering | `src/ui.rs` | Ratatui rendering without I/O or state mutation |
+```text
+PostgreSQL 18 -> asynchronous collector -> serializable observations -> app state
+                                                       |                 |
+                                               manual capture         pure render
+                                                       |                 |
+                                                 local SQLite            TUI
+                                                       |
+                                          two captures -> compare -> report/JSON
+```
 
-The event loop draws once, waits asynchronously for a meaningful event, updates
-state, and redraws. It does not poll a database or redraw on a timer. `futures-util`
-provides the stream adapter for Crossterm. Events currently request redraw or quit;
-resize causes Ratatui to recalculate the layout. A terminal guard restores normal
-mode on success or errors, and Ratatui installs a restoration panic hook.
+| Responsibility | Module |
+| --- | --- |
+| Runtime entry | `main.rs` |
+| CLI dispatch, asynchronous jobs, refresh timing | `lib.rs` |
+| Arguments and local path resolution | `cli.rs` |
+| Driver-independent observations and payload version | `model.rs` |
+| PostgreSQL queries, capabilities, safe collection errors | `collector.rs` |
+| Private SQLite history and schema migration | `store.rs` |
+| Pure deterministic snapshot comparison | `compare.rs` |
+| Markdown diagnostic reports | `report.rs` |
+| Synthetic demo observations | `demo.rs` |
+| Pure input-driven state transitions | `app.rs` |
+| Terminal input and interrupt translation | `event.rs` |
+| Terminal setup/restoration | `terminal.rs` |
+| Ratatui rendering without database/filesystem/network I/O | `ui.rs` |
 
-`anyhow` adds context at the application boundary. Only the application runner is
-public. There is no reusable SDK contract, plugin system, or multi-crate workspace.
+## Runtime and terminal
 
-## Planned data flow, not implemented
+Tokio runs a current-thread runtime. Collection and history work run in background
+jobs, while input, job completion, and a one-second status tick drive the event loop.
+Only one live collection is in flight at a time. The refresh interval skips missed
+ticks. Pause stops automatic collection; manual refresh remains available. Offline
+inspection stops automatic live refresh. Capturing requests a fresh collection;
+it never silently persists an old screen after a failed refresh.
 
-The intended flow is PostgreSQL observations -> application state -> TUI. A manual
-capture will persist a diagnostic snapshot to a local SQLite file. Comparing two
-saved captures will work without a live PostgreSQL connection.
+The app retains the last successful observation after a connection failure and
+identifies it as stale. SQLite failures appear separately from collector failures.
+Quitting aborts pending jobs and drops the terminal guard. The guard restores the
+terminal after normal exit and errors; Ratatui also installs its restoration panic
+hook. Rendering only reads state, including the clock value supplied by the runner.
 
-- Use SQLx with Tokio for PostgreSQL reads and SQLite persistence. Add the drivers
-  when implementing those capabilities, with minimal features and TLS for remote
-  PostgreSQL connections. Do not require a live database merely to compile.
-- Keep queries and row mapping in the collector, outside the TUI and domain model.
-  Read-only queries need bounded timeouts and a small connection footprint.
-- Introduce typed domain errors with `thiserror` where callers need to distinguish
-  failures. Add `tracing` with an explicit output destination that does not corrupt
-  the terminal; never log DSNs, credentials, or sensitive SQL by default.
-- Keep domain observations independent of Ratatui and SQLx types. Add concrete
-  modules as features arrive, rather than speculative traits or empty layers.
-- SQLite is a local history store, not part of the monitored database. Design its
-  versioned schema and migrations in the snapshot slice, not in the bootstrap.
+## PostgreSQL collection
 
-The first supported server target is PostgreSQL 18. Broader compatibility requires
-version-specific query checks and an expanded integration matrix before claiming it.
+SQLx uses one pooled connection and parameterized queries with runtime row mapping;
+compilation never requires a database. Collection rejects a superuser and pre-18
+servers. Startup settings enforce read-only transactions, statement timeouts, and
+a recognizable application name. Overall timeouts bound connection/collection work.
+Raw driver errors are converted into safe categories, without URL, server error
+text, credentials, or SQL. No logging subscriber writes into the terminal.
 
-## Diagnostic semantics
+Activity is scoped to the connected database and excludes the collector backend.
+`pg_blocking_pids()` provides blocker relationships directly from PostgreSQL;
+a missing blocker remains unresolved rather than being guessed from a PID.
+Aggregate statement statistics are collected separately, only when available.
+Collection records counter-reset metadata and individual `stats_since` values.
+Statement collection is bounded; truncation is explicit and prevents misleading
+set or counter comparisons. No monitored-server provisioning is performed.
 
-Activity comes from `pg_stat_activity`; blockers should use PostgreSQL's
-`pg_blocking_pids()` rather than guessing dependencies from matching lock rows.
-`pg_stat_statements` provides aggregate execution statistics when available, not
-the elapsed duration of a currently running query. Enabling the extension is an
-operator task; pgtrail must never configure a monitored server automatically.
+SQL text is opt-in. NULL values remain optional. Restricted visibility, missing
+extensions, denied access, and failed optional collection remain distinct from
+empty results and numeric zero. Collection timing describes the observation window;
+PostgreSQL activity and shared statistics can change during that window.
 
-Distinguish missing permissions, unavailable extensions, NULL values, no activity,
-and measured zero. A failed refresh must not silently present stale data as current.
-Each future capture needs collection timing and source/capability information so
-comparisons can identify incomplete data, different targets, and statistics resets.
-Do not derive execution deltas across a counter reset. Captures contain potentially
-sensitive operational data and stay local unless the user explicitly exports them.
+## History and comparison
 
-The local Compose fixture uses PostgreSQL 18, `pg_stat_statements`, and a dedicated
-monitoring role with `pg_read_all_stats`. The role has no application-table grants;
-read-only mode and a statement timeout add safeguards but do not replace privileges.
-The administrator exists only for fixture provisioning and maintenance.
+SQLite stores versioned JSON observations plus searchable capture metadata. The
+history schema uses a versioned, transactional migration and rejects future schema
+or snapshot versions. Saves are atomic. SQLite I/O stays outside rendering. New
+files and directories are private on Unix; existing user paths are not broadly
+re-permissioned. Captures contain no connection configuration.
+
+Source comparison checks endpoint, database identity, and server start time, plus
+system identifiers when available. A restart is conservatively incompatible. If
+system identifiers cannot be read, matching endpoint/database/OID/start time is an
+explicitly weaker identity check, with a warning. Different aliases cannot be
+silently equated. Missing session start times cannot establish identity, and reused
+PIDs never represent a continuing session.
+
+Statement identity includes database, user, query ID, and top-level status. Numeric
+deltas require compatible sources and capture windows, available complete metrics,
+consistent global and per-statement reset metadata, no eviction changes, and
+nondecreasing counters. A missing, reset, or incompatible metric is not a zero delta.
+Mean time over an interval comes from delta execution time divided by delta calls;
+subtracting cumulative averages would not describe interval performance.
+
+Reports preserve unavailable states and comparison warnings. Markdown text is
+escaped and control characters are removed for safe terminal/report display. JSON
+uses the versioned observation model. Exports are explicit, private, and do not
+overwrite existing files.
 
 ## References
 
-- [Cargo package layout](https://doc.rust-lang.org/cargo/guide/project-layout.html)
+- [SQLx 0.9 documentation](https://docs.rs/sqlx/0.9.0/sqlx/)
 - [Ratatui application patterns](https://ratatui.rs/concepts/application-patterns/the-elm-architecture/)
-- [PostgreSQL activity statistics](https://www.postgresql.org/docs/18/monitoring-stats.html)
-- [PostgreSQL statement statistics](https://www.postgresql.org/docs/18/pgstatstatements.html)
+- [PostgreSQL 18 activity statistics](https://www.postgresql.org/docs/18/monitoring-stats.html)
+- [PostgreSQL 18 statement statistics](https://www.postgresql.org/docs/18/pgstatstatements.html)

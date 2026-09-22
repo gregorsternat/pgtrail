@@ -4,7 +4,8 @@
 
 - pgtrail is a Rust TUI for PostgreSQL investigation and local snapshot comparison.
 - Read the README for implemented behavior; do not describe roadmap items as shipped.
-- The current binary is an interactive skeleton. It does not connect to PostgreSQL.
+- The v1 binary connects read-only to PostgreSQL 18, saves local SQLite snapshots,
+  and compares them offline; `--demo` uses explicitly synthetic data.
 - Keep code, documentation, user-facing text, commits, and PR descriptions in English.
 - Inspect the relevant code and existing changes before editing.
 - Keep each change focused on one coherent outcome.
@@ -39,7 +40,7 @@
 - Keep `main` thin; orchestration belongs in the library.
 - Translate terminal input into messages; update state separately from rendering.
 - Rendering must not perform database, filesystem, or network I/O.
-- Future PostgreSQL collection and SQLite persistence are separate responsibilities.
+- PostgreSQL collection and SQLite persistence are separate responsibilities.
 - Keep database I/O asynchronous and outside the rendering path.
 - Create modules when functionality needs them, not as empty placeholders.
 - Do not introduce a public API or trait solely for hypothetical reuse.
