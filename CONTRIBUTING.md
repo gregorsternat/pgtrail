@@ -33,11 +33,25 @@ Test behavior and useful failure modes; no coverage percentage is required.
 
 For terminal changes, also verify in an actual interactive terminal:
 
-1. Run `cargo run --locked -- --demo`; inspect all five views and keyboard help.
+1. Run `cargo run --locked -- --demo`; inspect all ten views and keyboard help.
 2. Resize the terminal, including a narrow window; the UI must remain responsive.
 3. Quit with `q`; the prompt and cursor must return normally.
 4. Run again and quit with `Ctrl+C`; check that typed shell input still echoes.
 5. Check `cargo run --locked </dev/null` fails clearly without terminal escapes.
+
+The dependency-free Python 3 PTY check exercises these boundaries with the built
+debug binary:
+
+```sh
+cargo build --locked
+python3 scripts/check-terminal.py
+```
+
+It navigates ten views and finding details, creates an incident with notes and
+attached captures, compares and reloads offline evidence, filters text containing
+`q`, resizes to tiny dimensions, and checks terminal restoration. It also interrupts
+a stalled PostgreSQL connection and a recorder waiting for a SQLite write lock.
+These automated checks complement visual inspection in your terminal.
 
 For database fixture changes, run `just db-up` and `just db-check`. The check
 connects over TCP as `pgtrail_monitor`, checks statistics access and role properties,
@@ -53,9 +67,36 @@ PGTRAIL_LIVE_TEST=1 cargo test --locked --lib -- --ignored --test-threads=1
 ```
 
 These tests are gated against the disposable Compose database. They exercise
-real monitoring, lock contention/unblocking, and failure paths. Ordinary
-`cargo test --locked` runs without PostgreSQL. Also try capturing two observations,
-restarting the TUI, loading a saved observation, and comparing the two in History.
+monitoring, lock contention/unblocking, supported health sections, and optional
+collection failures. Ordinary `cargo test --locked` runs without PostgreSQL. The
+live tests can alter fixture permissions to test recovery; never point them at an
+operational database.
+
+CI is configured with a separate PostgreSQL integration job for majors 16, 17, and
+18. To test another major locally, use its own Compose project and port. Export the
+same fixture settings for Compose, the privilege check, and the live tests:
+
+```sh
+export COMPOSE_PROJECT_NAME=pgtrail-check-16
+export PGTRAIL_POSTGRES_VERSION=16
+export PGTRAIL_POSTGRES_PORT=55416
+docker compose up -d --wait
+sh scripts/check-db.sh
+PGTRAIL_LIVE_TEST=1 cargo test --locked --lib -- --ignored --test-threads=1
+docker compose down
+```
+
+Repeat with `17` and another port/project when needed. Keep separate volumes per
+major; changing an image version is not a PostgreSQL data-directory upgrade. Clean
+up only the disposable project you created. `docker compose down` keeps its data;
+adding `--volumes` deliberately removes that project's development database.
+
+For incident/history changes, verify capture-and-attachment atomicity, closed and
+incompatible target rejection, annotations, chronology, and offline exports. For
+model changes, retain v1 capture readability and distinguish uncollected fields
+from observed NULLs and zero. Metric tests should cover resets, absent or reused
+identities, truncation, timing settings, and zero denominators. Tests must not
+depend on production credentials or a running server unless explicitly gated.
 
 ## Documentation and review
 

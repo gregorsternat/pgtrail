@@ -4,7 +4,7 @@
 
 - pgtrail is a Rust TUI for PostgreSQL investigation and local snapshot comparison.
 - Read the README for implemented behavior; do not describe roadmap items as shipped.
-- The v1 binary connects read-only to PostgreSQL 18, saves local SQLite snapshots,
+- The v1.1 binary connects read-only to PostgreSQL 16–18, saves local SQLite snapshots,
   and compares them offline; `--demo` uses explicitly synthetic data.
 - Keep code, documentation, user-facing text, commits, and PR descriptions in English.
 - Inspect the relevant code and existing changes before editing.

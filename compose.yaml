@@ -1,7 +1,10 @@
 services:
   postgres:
-    image: postgres:18
+    image: postgres:${PGTRAIL_POSTGRES_VERSION:-18}
     environment:
+      # Keep the existing PostgreSQL 18 volume layout. Versioned directories also
+      # work with 16/17; use a separate Compose project for each major version.
+      PGDATA: /var/lib/postgresql/${PGTRAIL_POSTGRES_VERSION:-18}/docker
       POSTGRES_USER: pgtrail_admin
       POSTGRES_DB: pgtrail_dev
       POSTGRES_PASSWORD: ${PGTRAIL_ADMIN_PASSWORD:-pgtrail-local-admin}

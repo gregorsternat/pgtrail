@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::VecDeque;
 
 use crate::{
     event::Message,
@@ -7,7 +8,7 @@ use crate::{
     store::SnapshotSummary,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     Refresh,
     Capture,
@@ -15,6 +16,13 @@ pub(crate) enum Action {
     Load(i64),
     Compare(i64, i64),
     ResumeLive,
+    ListIncidents,
+    SelectIncident(i64),
+    CreateIncident(String),
+    NoteIncident(i64, String),
+    CloseIncident(i64, bool),
+    AttachCapture(i64, i64),
+    LabelCapture(i64, String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -25,15 +33,25 @@ pub(crate) enum Tab {
     Blocking,
     Statements,
     History,
+    Database,
+    Relations,
+    Replication,
+    Io,
+    Incidents,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::Overview,
         Self::Activity,
         Self::Blocking,
         Self::Statements,
         Self::History,
+        Self::Database,
+        Self::Relations,
+        Self::Replication,
+        Self::Io,
+        Self::Incidents,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -47,6 +65,11 @@ impl Tab {
             Self::Blocking => "Blocking",
             Self::Statements => "Statements",
             Self::History => "History",
+            Self::Database => "Database",
+            Self::Relations => "Relations",
+            Self::Replication => "Replication",
+            Self::Io => "I/O",
+            Self::Incidents => "Incidents",
         }
     }
 }
@@ -69,13 +92,35 @@ impl StatementSort {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PromptKind {
+    Incident,
+    Note(i64),
+    Label(i64),
+}
+
+#[derive(Debug)]
+pub(crate) struct Prompt {
+    pub(crate) kind: PromptKind,
+    pub(crate) value: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrendPoint {
+    pub(crate) at: DateTime<Utc>,
+    pub(crate) transactions: Option<f64>,
+    pub(crate) wal_bytes: Option<f64>,
+    pub(crate) active: Option<f64>,
+    pub(crate) blocked: Option<f64>,
+}
+
 #[derive(Debug)]
 pub(crate) struct App {
     should_quit: bool,
     snapshot: Option<Snapshot>,
     paused: bool,
     offline: bool,
-    selected: [usize; 5],
+    selected: [usize; 10],
     filter_before_edit: String,
     pub(crate) demo: bool,
     pub(crate) tab: Tab,
@@ -91,7 +136,19 @@ pub(crate) struct App {
     pub(crate) compare_a: Option<i64>,
     pub(crate) compare_b: Option<i64>,
     pub(crate) report: Option<String>,
+    pub(crate) report_title: &'static str,
     pub(crate) report_scroll: usize,
+    pub(crate) analysis: Option<crate::diagnostics::Analysis>,
+    pub(crate) trend: VecDeque<TrendPoint>,
+    live_current: Option<Snapshot>,
+    live_previous: Option<Snapshot>,
+    pub(crate) statement_interval: bool,
+    pub(crate) show_indexes: bool,
+    pub(crate) relation_sort: usize,
+    pub(crate) incidents: Vec<crate::store::IncidentSummary>,
+    pub(crate) incident: Option<crate::store::Incident>,
+    pub(crate) active_incident: Option<i64>,
+    pub(crate) prompt: Option<Prompt>,
 }
 
 impl App {
@@ -101,7 +158,7 @@ impl App {
             snapshot: None,
             paused: false,
             offline: false,
-            selected: [0; 5],
+            selected: [0; 10],
             filter_before_edit: String::new(),
             demo,
             tab: Tab::Overview,
@@ -117,7 +174,19 @@ impl App {
             compare_a: None,
             compare_b: None,
             report: None,
+            report_title: "Offline comparison",
             report_scroll: 0,
+            analysis: None,
+            trend: VecDeque::new(),
+            live_current: None,
+            live_previous: None,
+            statement_interval: false,
+            show_indexes: false,
+            relation_sort: 0,
+            incidents: Vec::new(),
+            incident: None,
+            active_incident: None,
+            prompt: None,
         }
     }
 
@@ -138,12 +207,57 @@ impl App {
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: Snapshot, offline: bool) {
+        if !offline {
+            let is_new = self.live_current.as_ref().is_none_or(|old| {
+                old.completed_at != snapshot.completed_at || old.source != snapshot.source
+            });
+            if is_new {
+                if self.live_current.as_ref().is_some_and(|old| {
+                    !crate::compare::sources_compatible(&old.source, &snapshot.source)
+                }) {
+                    self.trend.clear();
+                }
+                self.live_previous = self.live_current.take();
+                self.live_current = Some(snapshot.clone());
+            }
+            let analysis = crate::diagnostics::analyze(&snapshot, self.live_previous.as_ref());
+            if is_new {
+                self.trend.push_back(TrendPoint {
+                    at: snapshot.completed_at,
+                    transactions: analysis
+                        .rates
+                        .database
+                        .available()
+                        .and_then(|v| v.transactions_per_second.available().copied()),
+                    wal_bytes: analysis
+                        .rates
+                        .wal
+                        .available()
+                        .and_then(|v| v.bytes_per_second.available().copied()),
+                    active: snapshot.activity.available().map(|v| {
+                        v.iter()
+                            .filter(|s| s.state.as_deref() == Some("active"))
+                            .count() as f64
+                    }),
+                    blocked: snapshot
+                        .activity
+                        .available()
+                        .map(|v| v.iter().filter(|s| !s.blockers.is_empty()).count() as f64),
+                });
+                while self.trend.len() > 120 {
+                    self.trend.pop_front();
+                }
+            }
+            self.analysis = Some(analysis);
+        } else {
+            self.analysis = Some(crate::diagnostics::analyze(&snapshot, None));
+        }
         self.snapshot = Some(snapshot);
         self.offline = offline;
         if offline {
             self.tab = Tab::Overview;
             self.filter.clear();
-            self.selected = [0; 5];
+            self.selected = [0; 10];
             self.report = None;
         }
         self.loading = false;
@@ -167,6 +281,7 @@ impl App {
     }
 
     pub(crate) fn set_report(&mut self, report: String) {
+        self.report_title = "Offline comparison";
         self.report = Some(report);
         self.report_scroll = 0;
         self.loading = false;
@@ -176,6 +291,20 @@ impl App {
         self.error = Some(error);
         self.loading = false;
         self.now = Utc::now();
+    }
+
+    pub(crate) fn collection_failed(&mut self, error: String) {
+        self.set_error(error);
+        self.trend.push_back(TrendPoint {
+            at: self.now,
+            transactions: None,
+            wal_bytes: None,
+            active: None,
+            blocked: None,
+        });
+        while self.trend.len() > 120 {
+            self.trend.pop_front();
+        }
     }
 
     pub(crate) fn set_notice(&mut self, notice: String) {
@@ -198,6 +327,9 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) -> Option<Action> {
+        if self.prompt.is_some() {
+            return self.edit_prompt(key);
+        }
         if self.editing_filter {
             self.edit_filter(key);
             return None;
@@ -219,13 +351,16 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Tab | KeyCode::Right => return self.switch_tab((self.tab.index() + 1) % 5),
-            KeyCode::BackTab | KeyCode::Left => return self.switch_tab((self.tab.index() + 4) % 5),
-            KeyCode::Char('1'..='5') => {
+            KeyCode::Tab | KeyCode::Right => return self.switch_tab((self.tab.index() + 1) % 10),
+            KeyCode::BackTab | KeyCode::Left => {
+                return self.switch_tab((self.tab.index() + 9) % 10);
+            }
+            KeyCode::Char('1'..='9') => {
                 if let KeyCode::Char(number) = key.code {
                     return self.switch_tab(number as usize - '1' as usize);
                 }
             }
+            KeyCode::Char('0') => return self.switch_tab(9),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::PageDown => self.move_selection(10),
@@ -235,6 +370,92 @@ impl App {
             KeyCode::Char('/') => {
                 self.editing_filter = true;
                 self.filter_before_edit = self.filter.clone();
+            }
+            KeyCode::Char('i') => {
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Incident,
+                    value: String::new(),
+                });
+            }
+            KeyCode::Char('n') if self.active_incident.is_some() => {
+                self.prompt = self.active_incident.map(|id| Prompt {
+                    kind: PromptKind::Note(id),
+                    value: String::new(),
+                });
+            }
+            KeyCode::Char('x') if self.tab == Tab::Incidents => {
+                self.active_incident = None;
+                self.notice = Some("New captures will not be attached to an incident.".into());
+            }
+            KeyCode::Char('o') if self.tab == Tab::Incidents => {
+                if let Some(incident) = self.filtered_incidents().get(self.selected()) {
+                    return Some(Action::CloseIncident(
+                        incident.id,
+                        incident.closed_at.is_none(),
+                    ));
+                }
+            }
+            KeyCode::Enter if self.tab == Tab::Overview && self.report.is_none() => {
+                let coverage = self
+                    .analysis
+                    .as_ref()
+                    .map(|a| a.coverage.join("\n\n"))
+                    .unwrap_or_else(|| "No analysis is available yet.".into());
+                let source = self
+                    .snapshot()
+                    .map(|s| {
+                        format!(
+                            "Source: {} / {}\nObserved: {}",
+                            s.source.endpoint,
+                            s.source.database,
+                            s.completed_at.to_rfc3339()
+                        )
+                    })
+                    .unwrap_or_else(|| "No observation is available.".into());
+                if let Some(finding) = self.filtered_findings().get(self.selected()) {
+                    let finding = (*finding).clone();
+                    self.set_report(format!("# {}\n\n{source}\n\nSeverity: {:?}\n\n## Evidence\n\n{}\n\n## Interpretation\n\n{}\n\n## Next steps\n\n{}\n\n## Coverage and limits\n\n{coverage}", finding.title, finding.severity, finding.evidence.join("\n\n"), finding.interpretation, finding.next_steps.join("\n\n")));
+                    self.report_title = "Finding details";
+                } else if self.analysis.is_some() {
+                    self.set_report(format!("# Coverage and limits\n\n{source}\n\nNo finding matches this view. Absence of findings does not establish database health.\n\n{coverage}"));
+                    self.report_title = "Coverage and limits";
+                }
+            }
+            KeyCode::Enter if self.tab == Tab::Incidents => {
+                if let Some(incident) = self.filtered_incidents().get(self.selected()) {
+                    return Some(Action::SelectIncident(incident.id));
+                }
+            }
+            KeyCode::Char('I') if self.tab == Tab::History => {
+                if let (Some(incident), Some(capture)) = (
+                    self.active_incident,
+                    self.filtered_history().get(self.selected()),
+                ) {
+                    return Some(Action::AttachCapture(incident, capture.id));
+                }
+                self.notice = Some(
+                    "Activate an open incident with 0 then Enter, or create one with i.".into(),
+                );
+            }
+            KeyCode::Char('l') if self.tab == Tab::History => {
+                if let Some(capture) = self.filtered_history().get(self.selected()) {
+                    self.prompt = Some(Prompt {
+                        kind: PromptKind::Label(capture.id),
+                        value: capture.label.clone(),
+                    });
+                }
+            }
+            KeyCode::Char('v') if self.tab == Tab::Statements => {
+                self.statement_interval = !self.statement_interval;
+                self.selected[self.tab.index()] = 0;
+            }
+            KeyCode::Char('v') if self.tab == Tab::Relations => {
+                self.show_indexes = !self.show_indexes;
+                self.selected[self.tab.index()] = 0;
+            }
+            KeyCode::Char('s') if self.tab == Tab::Relations => {
+                self.relation_sort = (self.relation_sort + 1) % 3;
+                self.selected[self.tab.index()] = 0;
             }
             KeyCode::Char('s') if self.tab == Tab::Statements => {
                 self.sort = match self.sort {
@@ -255,6 +476,7 @@ impl App {
                     .into(),
                 );
             }
+            KeyCode::Char('r') if self.tab == Tab::Incidents => return Some(Action::ListIncidents),
             KeyCode::Char('r') if self.tab == Tab::History => return Some(Action::ListHistory),
             KeyCode::Char('r') if !self.is_offline() => return Some(Action::Refresh),
             KeyCode::Char('c') => return Some(Action::Capture),
@@ -294,11 +516,12 @@ impl App {
             }
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
-                self.selected = [0; 5];
+                self.selected = [0; 10];
             }
             KeyCode::Esc if self.offline => {
                 self.offline = false;
                 self.snapshot = None;
+                self.analysis = None;
                 self.notice = Some("Returned to live monitoring.".into());
                 return Some(Action::ResumeLive);
             }
@@ -318,7 +541,11 @@ impl App {
         if resume_live {
             Some(Action::ResumeLive)
         } else {
-            (self.tab == Tab::History).then_some(Action::ListHistory)
+            match self.tab {
+                Tab::History => Some(Action::ListHistory),
+                Tab::Incidents => Some(Action::ListIncidents),
+                _ => None,
+            }
         }
     }
 
@@ -345,7 +572,7 @@ impl App {
             }
             _ => {}
         }
-        self.selected = [0; 5];
+        self.selected = [0; 10];
     }
 
     fn move_selection(&mut self, movement: isize) {
@@ -362,11 +589,25 @@ impl App {
 
     fn clamp_selection(&mut self) {
         let count = match self.tab {
-            Tab::Overview => 1,
+            Tab::Overview => self.filtered_findings().len(),
             Tab::Activity => self.filtered_sessions().len(),
             Tab::Blocking => self.blocking_edges().len(),
+            Tab::Statements if self.statement_interval => self.filtered_statement_rates().len(),
             Tab::Statements => self.filtered_statements().len(),
             Tab::History => self.filtered_history().len(),
+            Tab::Relations if self.show_indexes => self.filtered_indexes().len(),
+            Tab::Relations => self.filtered_tables().len(),
+            Tab::Incidents => self.filtered_incidents().len(),
+            Tab::Database => 40,
+            Tab::Replication => self
+                .snapshot()
+                .and_then(|s| s.health.replication.available())
+                .map_or(20, |r| (r.senders.len() + r.slots.len()) * 3 + 20),
+            Tab::Io => self.snapshot().map_or(20, |s| {
+                s.health.io.available().map_or(0, |rows| rows.len() * 2)
+                    + s.health.vacuum.available().map_or(0, |rows| rows.len() * 2)
+                    + 20
+            }),
         };
         self.selected[self.tab.index()] = self.selected().min(count.saturating_sub(1));
     }
@@ -462,6 +703,159 @@ impl App {
 
     fn matches(&self, value: &str) -> bool {
         value.to_lowercase().contains(&self.filter.to_lowercase())
+    }
+    fn edit_prompt(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => self.prompt = None,
+            KeyCode::Enter => {
+                let prompt = self.prompt.take()?;
+                if prompt.value.trim().is_empty() {
+                    self.notice = Some("Text cannot be empty.".into());
+                    return None;
+                }
+                return Some(match prompt.kind {
+                    PromptKind::Incident => Action::CreateIncident(prompt.value),
+                    PromptKind::Note(id) => Action::NoteIncident(id, prompt.value),
+                    PromptKind::Label(id) => Action::LabelCapture(id, prompt.value),
+                });
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.value.pop();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.value.clear();
+                }
+            }
+            KeyCode::Char(value)
+                if !value.is_control()
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                if let Some(prompt) = &mut self.prompt {
+                    let limit = if matches!(prompt.kind, PromptKind::Note(_)) {
+                        4000
+                    } else {
+                        200
+                    };
+                    if prompt.value.chars().count() < limit {
+                        prompt.value.push(value);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub(crate) fn set_incidents(&mut self, incidents: Vec<crate::store::IncidentSummary>) {
+        let selected_id = self
+            .filtered_incidents()
+            .get(self.selected[Tab::Incidents.index()])
+            .map(|v| v.id);
+        self.incidents = incidents;
+        if let Some(id) = selected_id
+            && let Some(index) = self.filtered_incidents().iter().position(|v| v.id == id)
+        {
+            self.selected[Tab::Incidents.index()] = index;
+        }
+        if self.active_incident.is_some_and(|id| {
+            self.incidents
+                .iter()
+                .any(|v| v.id == id && v.closed_at.is_some())
+        }) {
+            self.active_incident = None;
+        }
+        self.clamp_selection();
+    }
+    pub(crate) fn set_incident(&mut self, incident: crate::store::Incident) {
+        self.active_incident = incident
+            .summary
+            .closed_at
+            .is_none()
+            .then_some(incident.summary.id);
+        self.incident = Some(incident);
+    }
+    pub(crate) fn filtered_incidents(&self) -> Vec<&crate::store::IncidentSummary> {
+        self.incidents
+            .iter()
+            .filter(|v| self.matches(&format!("{} {}", v.id, v.title)))
+            .collect()
+    }
+    pub(crate) fn filtered_findings(&self) -> Vec<&crate::diagnostics::Finding> {
+        self.analysis
+            .iter()
+            .flat_map(|a| &a.findings)
+            .filter(|f| self.matches(&format!("{} {} {}", f.id, f.title, f.evidence.join(" "))))
+            .collect()
+    }
+    pub(crate) fn filtered_tables(&self) -> Vec<&crate::model::TableStats> {
+        let mut rows: Vec<_> = self
+            .snapshot
+            .iter()
+            .filter_map(|s| s.health.tables.available())
+            .flat_map(|r| &r.tables)
+            .filter(|t| self.matches(&format!("{} {} {}", t.oid, t.schema, t.name)))
+            .collect();
+        rows.sort_by(|a, b| {
+            match self.relation_sort {
+                1 => b.dead_tuples.cmp(&a.dead_tuples),
+                2 => b.seq_scan.cmp(&a.seq_scan),
+                _ => b.total_bytes.cmp(&a.total_bytes),
+            }
+            .then(a.oid.cmp(&b.oid))
+        });
+        rows
+    }
+    pub(crate) fn filtered_indexes(&self) -> Vec<&crate::model::IndexStats> {
+        let mut rows: Vec<_> = self
+            .snapshot
+            .iter()
+            .filter_map(|s| s.health.tables.available())
+            .flat_map(|r| &r.indexes)
+            .filter(|t| self.matches(&format!("{} {} {} {}", t.oid, t.schema, t.table, t.name)))
+            .collect();
+        rows.sort_by(|a, b| {
+            match self.relation_sort {
+                1 => a.valid.cmp(&b.valid),
+                2 => b.scans.cmp(&a.scans),
+                _ => b.size_bytes.cmp(&a.size_bytes),
+            }
+            .then(a.oid.cmp(&b.oid))
+        });
+        rows
+    }
+    pub(crate) fn filtered_statement_rates(&self) -> Vec<&crate::metrics::StatementRate> {
+        let mut rows: Vec<_> = self
+            .analysis
+            .iter()
+            .filter_map(|a| a.rates.statements.available())
+            .flatten()
+            .filter(|r| {
+                self.matches(&format!(
+                    "{} {} {}",
+                    r.identity.queryid, r.identity.userid, r.identity.dbid
+                ))
+            })
+            .collect();
+        let metric = |r: &crate::metrics::StatementRate| match self.sort {
+            StatementSort::Total => r.exec_ms_per_second.available().copied(),
+            StatementSort::Mean => r.mean_exec_ms.available().copied(),
+            StatementSort::Calls => r.calls_per_second.available().copied(),
+        };
+        rows.sort_by(|a, b| {
+            match (metric(a), metric(b)) {
+                (Some(a), Some(b)) => b.total_cmp(&a),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then(a.identity.queryid.cmp(&b.identity.queryid))
+        });
+        rows
     }
 }
 
@@ -635,5 +1029,169 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.filtered_statements().len(), 1);
         assert_eq!(app.filtered_statements()[0].queryid, 703);
+    }
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+    use crate::model::Observation;
+
+    fn key(app: &mut App, code: KeyCode) -> Option<Action> {
+        app.update(Message::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    fn sample(sequence: u64) -> Snapshot {
+        let mut snapshot = crate::demo::snapshot(sequence, false);
+        let time =
+            DateTime::from_timestamp(1_790_000_000 + sequence as i64 * 5, 0).unwrap_or_default();
+        snapshot.started_at = time;
+        snapshot.completed_at = time;
+        snapshot
+    }
+
+    #[test]
+    fn live_rates_and_bounded_trends_keep_offline_evidence_separate() {
+        let mut app = App::new(true);
+        app.set_snapshot(sample(0), false);
+        assert_eq!(app.trend.len(), 1);
+        assert!(app.trend[0].transactions.is_none());
+        app.set_snapshot(sample(1), false);
+        let rate = app.trend[1]
+            .transactions
+            .expect("second observation has an interval");
+        assert!((rate - 30.6).abs() < 0.001);
+        app.set_snapshot(sample(1), false);
+        assert_eq!(
+            app.trend.len(),
+            2,
+            "restoring an unchanged observation adds no point"
+        );
+        app.set_snapshot(sample(10), true);
+        assert!(
+            app.analysis
+                .as_ref()
+                .expect("offline diagnostics")
+                .rates
+                .elapsed_seconds
+                .is_none()
+        );
+        assert_eq!(app.trend.len(), 2);
+        assert_eq!(key(&mut app, KeyCode::Esc), Some(Action::ResumeLive));
+        assert!(app.snapshot().is_none());
+        assert!(
+            app.analysis.is_none(),
+            "offline findings cannot masquerade as live evidence"
+        );
+        app.set_snapshot(sample(1), false);
+        assert_eq!(app.trend.len(), 2);
+        app.collection_failed("unreachable".into());
+        assert!(
+            app.trend
+                .back()
+                .is_some_and(|point| point.transactions.is_none() && point.active.is_none())
+        );
+        for sequence in 2..130 {
+            app.set_snapshot(sample(sequence), false);
+        }
+        assert_eq!(app.trend.len(), 120);
+        let mut other = sample(130);
+        other.source.database = "another_database".into();
+        app.set_snapshot(other, false);
+        assert_eq!(
+            app.trend.len(),
+            1,
+            "trends never combine incompatible targets"
+        );
+        assert!(app.trend[0].transactions.is_none());
+    }
+
+    #[test]
+    fn unavailable_counters_do_not_become_zero_rates_or_hide_observed_activity() {
+        let mut app = App::new(true);
+        app.set_snapshot(sample(0), false);
+        let mut next = sample(1);
+        next.health.database = Observation::Unavailable("permission denied".into());
+        app.set_snapshot(next, false);
+        let point = app.trend.back().expect("new point");
+        assert!(point.transactions.is_none());
+        assert!(point.active.is_some());
+        assert!(
+            app.analysis
+                .as_ref()
+                .expect("analysis")
+                .coverage
+                .iter()
+                .any(|v| v.contains("permission denied"))
+        );
+    }
+
+    #[test]
+    fn incident_and_label_editors_accept_text_without_triggering_global_shortcuts() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('i'));
+        for character in "Query queue".chars() {
+            key(&mut app, KeyCode::Char(character));
+        }
+        assert!(!app.should_quit());
+        assert_eq!(
+            key(&mut app, KeyCode::Enter),
+            Some(Action::CreateIncident("Query queue".into()))
+        );
+        app.active_incident = Some(7);
+        key(&mut app, KeyCode::Char('n'));
+        for character in "qé evidence".chars() {
+            key(&mut app, KeyCode::Char(character));
+        }
+        assert_eq!(
+            key(&mut app, KeyCode::Enter),
+            Some(Action::NoteIncident(7, "qé evidence".into()))
+        );
+        key(&mut app, KeyCode::Char('i'));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.prompt.is_none());
+        assert!(!app.is_offline());
+        key(&mut app, KeyCode::Char('0'));
+        key(&mut app, KeyCode::Char('x'));
+        assert!(app.active_incident.is_none());
+        key(&mut app, KeyCode::Char('i'));
+        app.update(Message::Quit);
+        assert!(app.should_quit(), "Ctrl+C still exits an editor");
+    }
+
+    #[test]
+    fn finding_drilldown_and_new_views_have_working_navigation() {
+        let mut app = App::new(true);
+        app.set_snapshot(sample(0), false);
+        assert!(!app.filtered_findings().is_empty());
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.report_title, "Finding details");
+        assert!(
+            app.report
+                .as_ref()
+                .is_some_and(|v| v.contains("## Evidence") && v.contains("## Next steps"))
+        );
+        key(&mut app, KeyCode::PageDown);
+        assert!(app.report_scroll > 0);
+        key(&mut app, KeyCode::Esc);
+        assert!(app.report.is_none());
+        key(&mut app, KeyCode::Char('7'));
+        assert_eq!(app.tab, Tab::Relations);
+        let largest = app.filtered_tables()[0].oid;
+        key(&mut app, KeyCode::Char('s'));
+        assert_ne!(
+            app.filtered_tables()[0].oid,
+            largest,
+            "maintenance sorting differs from size ranking"
+        );
+        key(&mut app, KeyCode::Char('v'));
+        assert!(app.show_indexes);
+        assert!(!app.filtered_indexes().is_empty());
+        key(&mut app, KeyCode::Char('0'));
+        assert_eq!(app.tab, Tab::Incidents);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Overview);
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, Tab::Incidents);
     }
 }

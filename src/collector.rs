@@ -1,4 +1,6 @@
 //! Bounded, read-only PostgreSQL observations. Driver errors never leave this module.
+mod health;
+
 use std::{str::FromStr, time::Duration};
 
 use chrono::Utc;
@@ -23,7 +25,7 @@ pub(crate) enum CollectorError {
     InvalidTimeout,
     #[error("superuser connections are refused; use a non-superuser monitoring role")]
     Superuser,
-    #[error("PostgreSQL 18 or newer is required for these observations")]
+    #[error("PostgreSQL 16, 17, or 18 is required for these observations")]
     UnsupportedServer,
     #[error("the connection could not enforce read-only transactions")]
     ReadOnlyRequired,
@@ -158,7 +160,7 @@ impl Collector {
         if row.try_get::<bool, _>("superuser")? {
             return Err(CollectorError::Superuser);
         }
-        if row.try_get::<i32, _>("version_num")? < 180_000 {
+        if !supported_version(row.try_get("version_num")?) {
             return Err(CollectorError::UnsupportedServer);
         }
         if !row.try_get::<bool, _>("read_only")? {
@@ -196,9 +198,33 @@ impl Collector {
                 "Statement collection is limited to the {STATEMENT_LIMIT} largest entries by total execution time; lower-ranked entries are omitted."
             ));
         }
+        if statements.available().is_some_and(|stats| {
+            stats
+                .entries
+                .iter()
+                .any(|entry| entry.stats_since.is_none())
+        }) {
+            warnings.push("Per-statement reset epochs are unavailable in this extension version; cumulative rankings remain available, but safe per-statement deltas cannot be calculated.".into());
+        }
+        let health = health::collect(&mut transaction, all_stats).await?;
+        if health
+            .tables
+            .available()
+            .is_some_and(|stats| stats.truncated)
+        {
+            warnings.push("Relation collection is limited to 1000 tables and 1000 indexes selected by catalog size estimates in the current database. Larger relations may be omitted when estimates are stale; exact sizes are collected only for the bounded candidates.".into());
+        }
+        if health
+            .database
+            .available()
+            .is_some_and(|stats| !stats.track_counts)
+        {
+            warnings.push("track_counts is disabled; table and index counters cannot establish current workload or maintenance health.".into());
+        }
         transaction.commit().await?;
         Ok(Snapshot {
             schema_version: SNAPSHOT_VERSION,
+            health,
             started_at,
             completed_at: Utc::now(),
             source,
@@ -207,6 +233,10 @@ impl Collector {
             warnings,
         })
     }
+}
+
+fn supported_version(version_num: i32) -> bool {
+    (160_000..190_000).contains(&version_num)
 }
 
 fn connection_options(dsn: &str, timeout: Duration) -> Result<PgConnectOptions, CollectorError> {
@@ -439,9 +469,30 @@ async fn statement_rows(
         .await?;
     let reset_at = info.try_get("reset_at")?;
     let dealloc = info.try_get("dealloc")?;
+    // PG17 added this field, but an extension can retain an older SQL definition
+    // after a server upgrade. Inspect the actual view instead of guessing from
+    // server_version. A missing epoch stays NULL; the global reset time does not
+    // establish that a particular entry survived eviction or a targeted reset.
+    let has_stats_since: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT FROM pg_catalog.pg_attribute a
+            JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1 AND c.relname = 'pg_stat_statements'
+                AND a.attname = 'stats_since' AND a.attnum > 0 AND NOT a.attisdropped
+        )",
+    )
+    .bind(schema)
+    .fetch_one(&mut *connection)
+    .await?;
+    let stats_since = if has_stats_since {
+        "stats_since"
+    } else {
+        "NULL::timestamptz AS stats_since"
+    };
     let query = format!(
         "SELECT userid::bigint AS userid, dbid::bigint AS dbid, queryid, toplevel,
-                stats_since, calls, total_exec_time AS total_exec_ms,
+                {stats_since}, calls, total_exec_time AS total_exec_ms,
                 mean_exec_time AS mean_exec_ms, rows, shared_blks_hit, shared_blks_read,
                 temp_blks_written, CASE WHEN $1 THEN query ELSE NULL END AS query
          FROM {quoted_schema}.pg_stat_statements
@@ -495,6 +546,16 @@ fn statement_from_row(row: PgRow) -> Result<Statement, CollectorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supported_server_versions_are_explicit_and_bounded() {
+        for version in [160_000, 160_015, 170_000, 170_011, 180_000, 180_006] {
+            assert!(supported_version(version));
+        }
+        for version in [0, 150_019, 159_999, 190_000, 200_000] {
+            assert!(!supported_version(version));
+        }
+    }
 
     #[test]
     fn invalid_urls_and_driver_errors_never_expose_secrets() {
@@ -652,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the disposable PostgreSQL 18 Compose fixture and PGTRAIL_LIVE_TEST=1"]
+    #[ignore = "requires a disposable PostgreSQL 16-18 fixture and PGTRAIL_LIVE_TEST=1"]
     async fn live_read_only_collection_workload_and_blocking() {
         let (admin_options, monitor_dsn) = fixture_configuration();
         let mut blocker = fixture_admin(&admin_options).await;
@@ -661,8 +722,61 @@ mod tests {
             .expect("monitoring configuration");
         let snapshot = collector.collect().await.expect("initial observation");
         assert_eq!(snapshot.source.database, "pgtrail_dev");
-        assert!(snapshot.source.server_version.starts_with("18."));
+        let server_version: i32 =
+            sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&mut blocker)
+                .await
+                .expect("fixture server version");
+        assert!(supported_version(server_version));
         assert!(snapshot.started_at <= snapshot.completed_at);
+        let database = snapshot
+            .health
+            .database
+            .available()
+            .expect("database health");
+        assert!(database.size_bytes > 0);
+        assert!(database.num_backends >= 1);
+        assert!(database.cluster_backends >= database.num_backends);
+        assert!(database.max_connections > database.reserved_connections);
+        assert!(database.track_counts);
+        let relations = snapshot.health.tables.available().expect("relation health");
+        assert!(!relations.truncated);
+        let fixture_table = relations
+            .tables
+            .iter()
+            .find(|table| table.schema == "public" && table.name == "pgtrail_write_probe")
+            .expect("known fixture table");
+        assert!(fixture_table.total_bytes > 0);
+        assert!(fixture_table.table_bytes > 0);
+        assert!(fixture_table.index_bytes > 0);
+        let fixture_index = relations
+            .indexes
+            .iter()
+            .find(|index| {
+                index.table_oid == fixture_table.oid && index.name == "pgtrail_write_probe_pkey"
+            })
+            .expect("known fixture primary key");
+        assert!(fixture_index.primary && fixture_index.unique && fixture_index.valid);
+        let wal = snapshot.health.wal.available().expect("WAL health");
+        assert!(wal.records > 0 && wal.bytes > 0.0);
+        let io = snapshot.health.io.available().expect("I/O health");
+        assert!(!io.is_empty());
+        if !database.track_io_timing {
+            assert!(
+                io.iter()
+                    .filter(|entry| entry.object != "wal")
+                    .all(|entry| { entry.read_time_ms.is_none() && entry.write_time_ms.is_none() })
+            );
+        }
+        let replication = snapshot
+            .health
+            .replication
+            .available()
+            .expect("replication health");
+        assert!(!replication.in_recovery);
+        assert!(replication.replay_delay_seconds.is_none());
+        assert!(replication.receive_replay_lag_bytes.is_none());
+        assert!(snapshot.health.vacuum.available().is_some());
         assert!(
             snapshot
                 .activity
@@ -722,7 +836,14 @@ mod tests {
         assert!(workload.total_exec_ms >= 0.0);
         assert!(workload.mean_exec_ms >= 0.0);
         assert_eq!(workload.rows, workload.calls);
-        assert!(workload.stats_since.is_some());
+        assert_eq!(workload.stats_since.is_some(), server_version >= 170_000);
+        if server_version < 170_000 {
+            assert!(
+                workload_snapshot.warnings.iter().any(|warning| {
+                    warning.contains("Per-statement reset epochs are unavailable")
+                })
+            );
+        }
 
         let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut blocker)
@@ -790,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the disposable PostgreSQL 18 Compose fixture and PGTRAIL_LIVE_TEST=1"]
+    #[ignore = "requires a disposable PostgreSQL 16-18 fixture and PGTRAIL_LIVE_TEST=1"]
     async fn live_superuser_and_missing_extension_and_restricted_role() {
         let (admin_options, monitor_dsn) = fixture_configuration();
         let mut admin = fixture_admin(&admin_options).await;
@@ -899,11 +1020,152 @@ mod tests {
             limited_snapshot.statements,
             Observation::Unavailable(reason) if reason.contains("restricted")
         ));
+        assert!(limited_snapshot.health.database.available().is_some());
+        assert!(matches!(
+            limited_snapshot.health.replication,
+            Observation::Unavailable(reason) if reason.contains("restricted")
+        ));
+        assert!(matches!(
+            limited_snapshot.health.vacuum,
+            Observation::Unavailable(reason) if reason.contains("restricted")
+        ));
         assert!(
             limited_snapshot
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("restricted"))
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL 16-18 fixture and PGTRAIL_LIVE_TEST=1"]
+    async fn live_health_permission_failure_preserves_other_sections() {
+        let (admin_options, monitor_dsn) = fixture_configuration();
+        let mut admin = fixture_admin(&admin_options).await;
+        let database = format!("pgtrail_test_health_denied_{}", std::process::id());
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE DATABASE {}",
+            quote_identifier(&database)
+        )))
+        .execute(&mut admin)
+        .await
+        .expect("create isolated health-permission fixture database");
+        let mut isolated = admin_options
+            .clone()
+            .database(&database)
+            .connect()
+            .await
+            .expect("connect to isolated fixture database");
+        // Catalog view ACLs are database-local; no other live test loses access.
+        sqlx::query("REVOKE SELECT ON pg_catalog.pg_stat_wal FROM PUBLIC")
+            .execute(&mut isolated)
+            .await
+            .expect("restrict one isolated statistics view");
+        isolated
+            .close()
+            .await
+            .expect("close isolated fixture admin");
+        let dsn = monitor_dsn.replace("/pgtrail_dev?", &format!("/{database}?"));
+        let collector =
+            Collector::new(&dsn, false, Duration::from_secs(5)).expect("isolated health collector");
+        let snapshot = collector.collect().await;
+        collector.pool.close().await;
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE {}",
+            quote_identifier(&database)
+        )))
+        .execute(&mut admin)
+        .await
+        .expect("remove isolated fixture database");
+        let snapshot = snapshot.expect("health denial must not abort collection");
+        assert!(snapshot.activity.available().is_some());
+        assert!(snapshot.health.database.available().is_some());
+        assert!(snapshot.health.tables.available().is_some());
+        assert!(matches!(snapshot.health.wal,
+            Observation::Unavailable(reason) if reason.contains("permission denied")
+        ));
+        assert!(
+            snapshot.health.io.available().is_some(),
+            "query after denied section succeeds"
+        );
+        assert!(snapshot.health.vacuum.available().is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL 16-18 fixture and PGTRAIL_LIVE_TEST=1"]
+    async fn live_relation_candidates_are_bounded_and_truncation_is_explicit() {
+        let (admin_options, monitor_dsn) = fixture_configuration();
+        let mut admin = fixture_admin(&admin_options).await;
+        let database = format!("pgtrail_test_many_relations_{}", std::process::id());
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE DATABASE {}",
+            quote_identifier(&database)
+        )))
+        .execute(&mut admin)
+        .await
+        .expect("create isolated many-relations fixture database");
+        let mut isolated = admin_options
+            .clone()
+            .database(&database)
+            .connect()
+            .await
+            .expect("connect to isolated fixture database");
+        // Build more relations than the observation limit without affecting the
+        // normal fixture's health or concurrent collector integration tests.
+        sqlx::query(
+            "DO $$ BEGIN FOR i IN 1..1002 LOOP
+                EXECUTE format('CREATE TABLE public.pgtrail_small_%s (id integer PRIMARY KEY)', i);
+             END LOOP; END $$",
+        )
+        .execute(&mut isolated)
+        .await
+        .expect("create bounded-sampling fixture tables");
+        sqlx::query("CREATE TABLE public.pgtrail_large (id integer PRIMARY KEY)")
+            .execute(&mut isolated)
+            .await
+            .expect("create large fixture table");
+        sqlx::query("INSERT INTO public.pgtrail_large SELECT generate_series(1, 10000)")
+            .execute(&mut isolated)
+            .await
+            .expect("populate large fixture table");
+        sqlx::query("ANALYZE public.pgtrail_large")
+            .execute(&mut isolated)
+            .await
+            .expect("update fixture catalog size estimates");
+        isolated
+            .close()
+            .await
+            .expect("close isolated fixture admin");
+        let dsn = monitor_dsn.replace("/pgtrail_dev?", &format!("/{database}?"));
+        let collector =
+            Collector::new(&dsn, false, Duration::from_secs(5)).expect("many-relations collector");
+        let snapshot = collector.collect().await;
+        collector.pool.close().await;
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE {}",
+            quote_identifier(&database)
+        )))
+        .execute(&mut admin)
+        .await
+        .expect("remove many-relations fixture database");
+        let snapshot = snapshot.expect("bounded relation observation");
+        let relations = snapshot
+            .health
+            .tables
+            .available()
+            .expect("relation statistics");
+        assert!(relations.truncated);
+        assert_eq!(relations.tables.len(), 1000);
+        assert_eq!(relations.indexes.len(), 1000);
+        assert_eq!(relations.tables[0].name, "pgtrail_large");
+        assert_eq!(relations.indexes[0].name, "pgtrail_large_pkey");
+        assert!(relations.tables[0].table_bytes > 0);
+        assert_eq!(
+            relations.tables[0].total_bytes,
+            relations.tables[0].table_bytes + relations.tables[0].index_bytes
+        );
+        assert!(snapshot.warnings.iter().any(|warning| {
+            warning.contains("catalog size estimates") && warning.contains("omitted")
+        }));
     }
 }

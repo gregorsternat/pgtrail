@@ -4,10 +4,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::model::{Observation, Session, Snapshot, Source, Statement, StatementStats};
+use crate::model::{
+    IndexStats, Observation, Replica, ReplicationSlot, Session, Snapshot, Source, Statement,
+    StatementStats, TableStats,
+};
+use crate::{
+    diagnostics::{self, Analysis},
+    metrics::{self, IntervalMetrics},
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Comparison {
+    pub(crate) health: HealthComparison,
+    pub(crate) analysis: Analysis,
     pub(crate) before: DateTime<Utc>,
     pub(crate) after: DateTime<Utc>,
     pub(crate) source: Source,
@@ -101,8 +110,345 @@ pub(crate) struct StatementComparison {
     pub(crate) after_truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct HealthComparison {
+    pub(crate) database: Observation<DatabaseChange>,
+    pub(crate) relations: Observation<RelationComparison>,
+    pub(crate) replication: Observation<ReplicationComparison>,
+    pub(crate) rates: IntervalMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct DatabaseChange {
+    pub(crate) size_bytes_before: i64,
+    pub(crate) size_bytes_after: i64,
+    pub(crate) size_delta_bytes: Observation<i64>,
+    pub(crate) connections_before: i64,
+    pub(crate) connections_after: i64,
+    pub(crate) cluster_connections_before: i64,
+    pub(crate) cluster_connections_after: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct RelationComparison {
+    pub(crate) tables: Vec<TableChange>,
+    pub(crate) indexes: Vec<IndexChange>,
+    pub(crate) before_truncated: bool,
+    pub(crate) after_truncated: bool,
+    pub(crate) caveats: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct TableChange {
+    pub(crate) oid: i64,
+    pub(crate) before: Option<TableStats>,
+    pub(crate) after: Option<TableStats>,
+    pub(crate) size_delta_bytes: Observation<i64>,
+    pub(crate) estimated_live_tuple_change: Observation<i64>,
+    pub(crate) estimated_dead_tuple_change: Observation<i64>,
+    pub(crate) sequential_scans: Observation<i64>,
+    pub(crate) index_scans: Observation<i64>,
+    pub(crate) inserts: Observation<i64>,
+    pub(crate) updates: Observation<i64>,
+    pub(crate) deletes: Observation<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct IndexChange {
+    pub(crate) oid: i64,
+    pub(crate) before: Option<IndexStats>,
+    pub(crate) after: Option<IndexStats>,
+    pub(crate) size_delta_bytes: Observation<i64>,
+    pub(crate) scans: Observation<i64>,
+    pub(crate) tuples_read: Observation<i64>,
+    pub(crate) tuples_fetched: Observation<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ReplicationComparison {
+    pub(crate) in_recovery_before: bool,
+    pub(crate) in_recovery_after: bool,
+    pub(crate) received_replay_backlog_delta_bytes: Observation<i64>,
+    pub(crate) senders_before: Vec<Replica>,
+    pub(crate) senders_after: Vec<Replica>,
+    pub(crate) slots: Vec<SlotChange>,
+    pub(crate) caveats: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct SlotChange {
+    pub(crate) name: String,
+    pub(crate) before: Option<ReplicationSlot>,
+    pub(crate) after: Option<ReplicationSlot>,
+    pub(crate) retained_delta_bytes: Observation<i64>,
+}
+
+fn compare_health(before: &Snapshot, after: &Snapshot) -> HealthComparison {
+    let rates = metrics::between(before, after);
+    let mut result = HealthComparison {
+        database: Observation::Unavailable("Not compared".into()),
+        relations: Observation::Unavailable("Not compared".into()),
+        replication: Observation::Unavailable("Not compared".into()),
+        rates,
+    };
+    if let Err(reason) = metrics::interval_seconds(before, after) {
+        result.database = Observation::Unavailable(reason.clone());
+        result.relations = Observation::Unavailable(reason.clone());
+        result.replication = Observation::Unavailable(reason);
+        return result;
+    }
+    result.database = match (&before.health.database, &after.health.database) {
+        (Observation::Available(left), Observation::Available(right)) => {
+            Observation::Available(DatabaseChange {
+                size_bytes_before: left.size_bytes,
+                size_bytes_after: right.size_bytes,
+                size_delta_bytes: gauge_delta(left.size_bytes, right.size_bytes),
+                connections_before: left.num_backends,
+                connections_after: right.num_backends,
+                cluster_connections_before: left.cluster_backends,
+                cluster_connections_after: right.cluster_backends,
+            })
+        }
+        (left, right) => Observation::Unavailable(unavailable_reason("Database", left, right)),
+    };
+    let counter_problem = match (&before.health.database, &after.health.database) {
+        (Observation::Available(left), Observation::Available(right)) => {
+            metrics::database_baseline_problem(left, right)
+        }
+        _ => Some(
+            "Database statistics/reset metadata unavailable; relation counter continuity unknown"
+                .into(),
+        ),
+    };
+    result.relations = match (&before.health.tables, &after.health.tables) {
+        (Observation::Available(left), Observation::Available(right)) => {
+            let before_tables: BTreeMap<_, _> =
+                left.tables.iter().map(|table| (table.oid, table)).collect();
+            let after_tables: BTreeMap<_, _> = right
+                .tables
+                .iter()
+                .map(|table| (table.oid, table))
+                .collect();
+            let before_indexes: BTreeMap<_, _> = left
+                .indexes
+                .iter()
+                .map(|index| (index.oid, index))
+                .collect();
+            let after_indexes: BTreeMap<_, _> = right
+                .indexes
+                .iter()
+                .map(|index| (index.oid, index))
+                .collect();
+            if before_tables.len() != left.tables.len()
+                || after_tables.len() != right.tables.len()
+                || before_indexes.len() != left.indexes.len()
+                || after_indexes.len() != right.indexes.len()
+            {
+                Observation::Unavailable("Duplicate relation OIDs make matching ambiguous".into())
+            } else {
+                let table_keys: BTreeSet<_> = before_tables
+                    .keys()
+                    .chain(after_tables.keys())
+                    .copied()
+                    .collect();
+                let index_keys: BTreeSet<_> = before_indexes
+                    .keys()
+                    .chain(after_indexes.keys())
+                    .copied()
+                    .collect();
+                let tables = table_keys
+                    .into_iter()
+                    .map(|oid| {
+                        table_change(
+                            oid,
+                            before_tables.get(&oid).copied(),
+                            after_tables.get(&oid).copied(),
+                            counter_problem.as_deref(),
+                        )
+                    })
+                    .collect();
+                let indexes = index_keys
+                    .into_iter()
+                    .map(|oid| {
+                        index_change(
+                            oid,
+                            before_indexes.get(&oid).copied(),
+                            after_indexes.get(&oid).copied(),
+                            counter_problem.as_deref(),
+                        )
+                    })
+                    .collect();
+                Observation::Available(RelationComparison { tables, indexes, before_truncated: left.truncated, after_truncated: right.truncated,
+                    caveats: vec!["Relations are matched by OID and observed names. Truncated rankings cannot prove creation or removal. OID reuse between captures cannot be fully excluded.".into(), "Tuple counts are estimates, not exact row counts or bloat measurements. Size and estimate changes are gauges and may be negative.".into(), "Usage deltas require track_counts, matching database reset epochs (including two observed SQL NULL values before any recorded reset), and non-regressing counters. PostgreSQL single-relation resets also update the database reset timestamp. Zero index scans is not a recommendation to drop an index.".into()],
+                })
+            }
+        }
+        (left, right) => {
+            Observation::Unavailable(unavailable_reason("Tables and indexes", left, right))
+        }
+    };
+    result.replication = match (&before.health.replication, &after.health.replication) {
+        (Observation::Available(left), Observation::Available(right)) => {
+            let before_slots: BTreeMap<_, _> = left
+                .slots
+                .iter()
+                .map(|slot| (slot.name.clone(), slot))
+                .collect();
+            let after_slots: BTreeMap<_, _> = right
+                .slots
+                .iter()
+                .map(|slot| (slot.name.clone(), slot))
+                .collect();
+            if before_slots.len() != left.slots.len() || after_slots.len() != right.slots.len() {
+                Observation::Unavailable("Duplicate slot names make matching ambiguous".into())
+            } else {
+                let names: BTreeSet<_> = before_slots
+                    .keys()
+                    .chain(after_slots.keys())
+                    .cloned()
+                    .collect();
+                let slots = names
+                    .into_iter()
+                    .map(|name| {
+                        let previous = before_slots.get(&name).copied();
+                        let current = after_slots.get(&name).copied();
+                        let retained_delta_bytes = match (previous, current) {
+                            (Some(a), Some(b))
+                                if a.slot_type == b.slot_type && a.database == b.database =>
+                            {
+                                optional_gauge_delta(a.retained_bytes, b.retained_bytes)
+                            }
+                            _ => Observation::Unavailable(
+                                "Slot has no compatible observed counterpart".into(),
+                            ),
+                        };
+                        SlotChange {
+                            name,
+                            before: previous.cloned(),
+                            after: current.cloned(),
+                            retained_delta_bytes,
+                        }
+                    })
+                    .collect();
+                Observation::Available(ReplicationComparison {
+                    in_recovery_before: left.in_recovery, in_recovery_after: right.in_recovery,
+                    received_replay_backlog_delta_bytes: if left.in_recovery && right.in_recovery {
+                        optional_gauge_delta(left.receive_replay_lag_bytes, right.receive_replay_lag_bytes)
+                    } else { Observation::Unavailable("Received-to-replay backlog is only comparable on a standby".into()) },
+                    senders_before: left.senders.clone(), senders_after: right.senders.clone(), slots,
+                    caveats: vec!["Backlog and retained-WAL changes compare observed gauges, not generated or transmitted bytes. Slot names may be recreated between captures.".into(), "Sender observations are shown separately: sender PID alone cannot establish backend identity across captures. Time since last replay is not a reliable lag measure on an idle primary.".into()],
+                })
+            }
+        }
+        (left, right) => Observation::Unavailable(unavailable_reason("Replication", left, right)),
+    };
+    result
+}
+
+fn gauge_delta(before: i64, after: i64) -> Observation<i64> {
+    if before < 0 || after < 0 {
+        return Observation::Unavailable("Observed gauge is invalid (negative)".into());
+    }
+    match after.checked_sub(before) {
+        Some(delta) => Observation::Available(delta),
+        None => Observation::Unavailable("Gauge change exceeds supported integer range".into()),
+    }
+}
+
+fn optional_gauge_delta(before: Option<i64>, after: Option<i64>) -> Observation<i64> {
+    match (before, after) {
+        (Some(before), Some(after)) => gauge_delta(before, after),
+        _ => Observation::Unavailable("At least one gauge is unavailable / NULL".into()),
+    }
+}
+
+fn table_change(
+    oid: i64,
+    before: Option<&TableStats>,
+    after: Option<&TableStats>,
+    counter_problem: Option<&str>,
+) -> TableChange {
+    let pair = before
+        .zip(after)
+        .filter(|(a, b)| a.schema == b.schema && a.name == b.name);
+    let gauge = |field: fn(&TableStats) -> i64| {
+        pair.map_or_else(
+            || {
+                Observation::Unavailable(
+                    "No same-named relation with a shared OID in both captures".into(),
+                )
+            },
+            |(a, b)| gauge_delta(field(a), field(b)),
+        )
+    };
+    let counter = |field: fn(&TableStats) -> i64| {
+        if let Some(reason) = counter_problem {
+            return Observation::Unavailable(reason.into());
+        }
+        pair.map_or_else(
+            || Observation::Unavailable("No compatible relation baseline".into()),
+            |(a, b)| metrics::counter_delta(field(a), field(b), "Relation"),
+        )
+    };
+    let index_scans = if let Some(reason) = counter_problem {
+        Observation::Unavailable(reason.into())
+    } else {
+        match pair.and_then(|(a, b)| a.idx_scan.zip(b.idx_scan)) {
+            Some((a, b)) => metrics::counter_delta(a, b, "Relation index scans"),
+            None => Observation::Unavailable("Relation index scans are unavailable / NULL".into()),
+        }
+    };
+    TableChange {
+        oid,
+        before: before.cloned(),
+        after: after.cloned(),
+        size_delta_bytes: gauge(|t| t.total_bytes),
+        estimated_live_tuple_change: gauge(|t| t.live_tuples),
+        estimated_dead_tuple_change: gauge(|t| t.dead_tuples),
+        sequential_scans: counter(|t| t.seq_scan),
+        index_scans,
+        inserts: counter(|t| t.inserts),
+        updates: counter(|t| t.updates),
+        deletes: counter(|t| t.deletes),
+    }
+}
+
+fn index_change(
+    oid: i64,
+    before: Option<&IndexStats>,
+    after: Option<&IndexStats>,
+    counter_problem: Option<&str>,
+) -> IndexChange {
+    let pair = before
+        .zip(after)
+        .filter(|(a, b)| a.schema == b.schema && a.name == b.name && a.table_oid == b.table_oid);
+    let counter = |field: fn(&IndexStats) -> i64| {
+        if let Some(reason) = counter_problem {
+            return Observation::Unavailable(reason.into());
+        }
+        pair.map_or_else(
+            || Observation::Unavailable("No compatible index baseline".into()),
+            |(a, b)| metrics::counter_delta(field(a), field(b), "Index"),
+        )
+    };
+    IndexChange {
+        oid,
+        before: before.cloned(),
+        after: after.cloned(),
+        size_delta_bytes: pair.map_or_else(
+            || Observation::Unavailable("No compatible index baseline".into()),
+            |(a, b)| gauge_delta(a.size_bytes, b.size_bytes),
+        ),
+        scans: counter(|t| t.scans),
+        tuples_read: counter(|t| t.tuples_read),
+        tuples_fetched: counter(|t| t.tuples_fetched),
+    }
+}
+
 pub(crate) fn compare(before: &Snapshot, after: &Snapshot) -> Comparison {
     let mut result = Comparison {
+        health: compare_health(before, after),
+        analysis: diagnostics::analyze(after, Some(before)),
         before: before.completed_at,
         after: after.completed_at,
         source: before.source.clone(),
@@ -123,8 +469,8 @@ pub(crate) fn compare(before: &Snapshot, after: &Snapshot) -> Comparison {
         result.statements = Observation::Unavailable(reason);
         return result;
     }
-    if before.schema_version != after.schema_version
-        || before.schema_version != crate::model::SNAPSHOT_VERSION
+    if !(1..=crate::model::SNAPSHOT_VERSION).contains(&before.schema_version)
+        || !(1..=crate::model::SNAPSHOT_VERSION).contains(&after.schema_version)
     {
         let reason = "Snapshot format versions are incompatible".to_owned();
         result.sessions = Observation::Unavailable(reason.clone());
@@ -181,7 +527,7 @@ pub(crate) fn compare(before: &Snapshot, after: &Snapshot) -> Comparison {
     result
 }
 
-fn sources_compatible(before: &Source, after: &Source) -> bool {
+pub(crate) fn sources_compatible(before: &Source, after: &Source) -> bool {
     !before.endpoint.is_empty()
         && !before.database.is_empty()
         && before.database_oid > 0
@@ -417,7 +763,7 @@ fn global_delta_problem(
     None
 }
 
-fn compare_statements(
+pub(crate) fn compare_statements(
     before: &StatementStats,
     after: &StatementStats,
     interval_ms: Option<i64>,
@@ -583,6 +929,7 @@ pub(crate) mod tests {
             .with_timezone(&Utc);
         Snapshot {
             schema_version: SNAPSHOT_VERSION,
+            health: crate::demo::snapshot(0, false).health,
             started_at: time,
             completed_at: time + Duration::milliseconds(50),
             source: Source {
@@ -920,5 +1267,141 @@ pub(crate) mod tests {
             sessions.reverse();
         }
         assert_eq!(compare(&before, &after), original);
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn later(before: &Snapshot) -> Snapshot {
+        let mut after = before.clone();
+        after.started_at += Duration::seconds(10);
+        after.completed_at += Duration::seconds(10);
+        after
+    }
+
+    #[test]
+    fn relation_gauges_can_shrink_while_regressed_usage_remains_unknown() {
+        let before = tests::snapshot();
+        let mut after = later(&before);
+        if let Observation::Available(relations) = &mut after.health.tables {
+            relations.tables[0].total_bytes -= 8192;
+            relations.tables[0].dead_tuples -= 100;
+            relations.tables[0].seq_scan = 0;
+            relations.tables[0].updates += 50;
+            relations.indexes[0].scans += 10;
+        }
+        let comparison = compare(&before, &after);
+        let relations = comparison.health.relations.available().unwrap();
+        assert_eq!(
+            relations.tables[0].size_delta_bytes.available(),
+            Some(&-8192)
+        );
+        assert_eq!(
+            relations.tables[0].estimated_dead_tuple_change.available(),
+            Some(&-100)
+        );
+        assert!(relations.tables[0].sequential_scans.available().is_none());
+        assert_eq!(relations.tables[0].updates.available(), Some(&50));
+        assert_eq!(relations.indexes[0].scans.available(), Some(&10));
+    }
+
+    #[test]
+    fn database_reset_does_not_erase_observed_size_or_fabricate_usage() {
+        let before = tests::snapshot();
+        let mut after = later(&before);
+        if let Observation::Available(db) = &mut after.health.database {
+            db.stats_reset = None;
+        }
+        if let Observation::Available(relations) = &mut after.health.tables {
+            relations.tables[0].total_bytes += 8192;
+        }
+        let comparison = compare(&before, &after);
+        let relations = comparison.health.relations.available().unwrap();
+        assert_eq!(
+            relations.tables[0].size_delta_bytes.available(),
+            Some(&8192)
+        );
+        assert!(relations.tables[0].updates.available().is_none());
+        assert!(comparison.health.rates.database.available().is_none());
+    }
+
+    #[test]
+    fn missing_truncated_or_renamed_relation_never_gets_an_invented_delta() {
+        let before = tests::snapshot();
+        let mut after = later(&before);
+        if let Observation::Available(relations) = &mut after.health.tables {
+            relations.truncated = true;
+            relations.tables.remove(1);
+            relations.tables[0].name = "renamed_orders".into();
+        }
+        let comparison = compare(&before, &after);
+        let relations = comparison.health.relations.available().unwrap();
+        assert!(relations.after_truncated);
+        assert_eq!(relations.tables.len(), 2);
+        assert!(
+            relations
+                .tables
+                .iter()
+                .all(|table| table.size_delta_bytes.available().is_none())
+        );
+        assert!(relations.tables[1].after.is_none());
+        assert!(
+            relations
+                .caveats
+                .iter()
+                .any(|reason| reason.contains("cannot prove creation or removal"))
+        );
+    }
+
+    #[test]
+    fn replica_sender_pid_is_not_treated_as_a_durable_backend_identity() {
+        let before = tests::snapshot();
+        let mut after = later(&before);
+        if let Observation::Available(replication) = &mut after.health.replication {
+            replication.slots[0].retained_bytes = Some(8_000_000);
+            replication.senders[0].application = "different-replica".into();
+        }
+        let comparison = compare(&before, &after);
+        let replication = comparison.health.replication.available().unwrap();
+        assert_eq!(
+            replication.slots[0].retained_delta_bytes.available(),
+            Some(&-8_000_000)
+        );
+        assert_ne!(
+            replication.senders_before[0].application,
+            replication.senders_after[0].application
+        );
+        assert!(
+            replication
+                .caveats
+                .iter()
+                .any(|reason| reason.contains("PID alone cannot establish"))
+        );
+    }
+
+    #[test]
+    fn original_snapshot_format_still_compares_sessions_and_statements() {
+        let mut before = tests::snapshot();
+        before.schema_version = 1;
+        before.health = Default::default();
+        let mut after = later(&before);
+        after.schema_version = 2;
+        after.health = crate::demo::snapshot(0, false).health;
+        let comparison = compare(&before, &after);
+        assert!(comparison.sessions.available().is_some());
+        assert!(
+            comparison
+                .statements
+                .available()
+                .unwrap()
+                .total
+                .available()
+                .is_some()
+        );
+        assert!(comparison.health.database.available().is_none());
+        assert!(comparison.health.relations.available().is_none());
     }
 }

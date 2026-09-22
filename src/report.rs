@@ -1,6 +1,8 @@
 //! Inspectable Markdown exports. Escape database-controlled text before rendering it.
 use crate::{
     compare::{BlockingEdge, Comparison, SessionChange, StatementChange, StatementDelta},
+    diagnostics::{self, Analysis},
+    metrics::IntervalMetrics,
     model::{Observation, Session, Snapshot, Statement},
 };
 
@@ -15,6 +17,8 @@ pub(crate) fn snapshot_markdown(snapshot: &Snapshot) -> String {
         if snapshot.is_complete() { "complete" } else { "partial; inspect unavailable metrics and warnings" }, snapshot.schema_version,
     ));
     warnings(&mut output, &snapshot.warnings);
+    analysis_sections(&mut output, &diagnostics::analyze(snapshot, None));
+    health_sections(&mut output, snapshot);
     output.push_str("## Sessions\n\nQuery age is elapsed time for a currently active query. Transaction age includes idle time in an open transaction. Missing fields are unavailable or NULL, never measured zero.\n\n");
     match &snapshot.activity {
         Observation::Available(sessions) => {
@@ -121,6 +125,8 @@ pub(crate) fn comparison_markdown(comparison: &Comparison) -> String {
         escape(&comparison.after_source.endpoint), escape(&comparison.after_source.database), comparison.after_source.database_oid,
         comparison.after_source.server_started_at.to_rfc3339(), optional(comparison.after_source.system_identifier.as_deref())));
     warnings(&mut output, &comparison.warnings);
+    analysis_sections(&mut output, &comparison.analysis);
+    health_comparison_sections(&mut output, comparison);
     output.push_str("## Session changes\n\nSessions are matched by PID and backend start time. Reused PIDs are separate sessions. Missing backend identity is reported as unknown.\n\n");
     match &comparison.sessions {
         Observation::Unavailable(reason) => unavailable(&mut output, reason),
@@ -206,6 +212,438 @@ pub(crate) fn comparison_markdown(comparison: &Comparison) -> String {
         }
     }
     output
+}
+
+pub(crate) fn analysis_markdown(analysis: &Analysis) -> String {
+    let mut output = String::new();
+    analysis_sections(&mut output, analysis);
+    output
+}
+
+fn analysis_sections(output: &mut String, analysis: &Analysis) {
+    output.push_str("## Investigation findings\n\nFindings separate observed evidence from possible explanations. Thresholds are investigation prompts, not universal SLOs. No server changes are performed.\n\n");
+    if analysis.findings.is_empty() {
+        output.push_str("No configured finding was triggered in the available observations. This does not establish that the database is healthy.\n\n");
+    }
+    for finding in &analysis.findings {
+        output.push_str(&format!(
+            "### {:?}: {}\n\n",
+            finding.severity,
+            escape(&finding.title)
+        ));
+        output.push_str(&format!(
+            "Finding ID: {}. Related PIDs: {:?}.\n\n",
+            escape(&finding.id),
+            finding.related_pids
+        ));
+        for item in &finding.evidence {
+            output.push_str(&format!("- Evidence: {}\n", escape(item)));
+        }
+        output.push_str(&format!("\n{}\n\n", escape(&finding.interpretation)));
+        for step in &finding.next_steps {
+            output.push_str(&format!("- Next: {}\n", escape(step)));
+        }
+        output.push('\n');
+    }
+    output.push_str("## Analysis coverage\n\n");
+    for line in &analysis.coverage {
+        output.push_str(&format!("- {}\n", escape(line)));
+    }
+    output.push('\n');
+    interval_sections(output, &analysis.rates);
+}
+
+fn observed<T: std::fmt::Display>(observation: &Observation<T>) -> String {
+    match observation {
+        Observation::Available(value) => escape(&value.to_string()),
+        Observation::Unavailable(reason) => format!("Unavailable: {}", escape(reason)),
+    }
+}
+
+fn observed_decimal(observation: &Observation<f64>) -> String {
+    match observation {
+        Observation::Available(value) => decimal(*value),
+        Observation::Unavailable(reason) => format!("Unavailable: {}", escape(reason)),
+    }
+}
+
+fn interval_sections(output: &mut String, rates: &IntervalMetrics) {
+    output.push_str("## Database and WAL interval rates\n\nRates use nonoverlapping, compatible captures and completion-to-completion elapsed time. Resets, unknown continuity, and counter regressions remain unavailable. PostgreSQL statistics may lag activity.\n\n");
+    output.push_str(&format!(
+        "Elapsed seconds: {}.\n\n",
+        rates
+            .elapsed_seconds
+            .map(decimal)
+            .unwrap_or_else(|| "Unavailable".into())
+    ));
+    match &rates.database {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(db) => {
+            output.push_str(&format!("Baseline: {}.\n\n", escape(&db.baseline)));
+            output.push_str("| Database metric | Interval rate / value |\n| --- | --- |\n");
+            for (label, metric) in [
+                ("Transactions / second", &db.transactions_per_second),
+                ("Commits / second", &db.commits_per_second),
+                ("Rollbacks / second", &db.rollbacks_per_second),
+                ("Rollback share (%)", &db.rollback_percent),
+                ("Shared block reads / second", &db.reads_per_second),
+                ("Shared block hits / second", &db.hits_per_second),
+                ("Shared buffer hit share (%)", &db.cache_hit_percent),
+                ("Temporary bytes / second", &db.temp_bytes_per_second),
+                ("Deadlocks / second", &db.deadlocks_per_second),
+                ("Inserted tuples / second", &db.inserted_per_second),
+                ("Updated tuples / second", &db.updated_per_second),
+                ("Deleted tuples / second", &db.deleted_per_second),
+                ("Read time (ms / second)", &db.read_ms_per_second),
+                ("Write time (ms / second)", &db.write_ms_per_second),
+            ] {
+                output.push_str(&format!("| {label} | {} |\n", observed_decimal(metric)));
+            }
+            output.push_str(&format!(
+                "| Deadlocks during interval | {} |\n| Temporary bytes during interval | {} |\n\n",
+                observed(&db.deadlocks),
+                observed(&db.temp_bytes)
+            ));
+            output.push_str("Shared-buffer hits exclude the operating-system page cache. Read time is not a storage utilization percentage; concurrent work may overlap. A zero-event ratio is undefined.\n\n");
+        }
+    }
+    match &rates.wal {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(wal) => {
+            output.push_str("| Cluster WAL metric | Interval rate |\n| --- | --- |\n");
+            for (label, value) in [
+                ("WAL bytes / second", &wal.bytes_per_second),
+                ("WAL records / second", &wal.records_per_second),
+                (
+                    "WAL buffer-full events / second",
+                    &wal.buffers_full_per_second,
+                ),
+            ] {
+                output.push_str(&format!("| {label} | {} |\n", observed_decimal(value)));
+            }
+            output.push_str("\nWAL statistics cover the cluster; database transaction rates cover the selected database.\n\n");
+        }
+    }
+    output.push_str("### Statement interval rates\n\n");
+    match &rates.statements {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(entries) => {
+            if entries.is_empty() {
+                output.push_str("No statement entries observed in either capture.\n\n");
+            } else {
+                output.push_str("| Query ID | User OID | Database OID | Top level | Calls / s | Exec ms / s | Interval mean (ms) | Shared reads / s | Temp blocks / s |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+                for entry in entries {
+                    output.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        entry.identity.queryid,
+                        entry.identity.userid,
+                        entry.identity.dbid,
+                        entry.identity.toplevel,
+                        observed_decimal(&entry.calls_per_second),
+                        observed_decimal(&entry.exec_ms_per_second),
+                        observed_decimal(&entry.mean_exec_ms),
+                        observed_decimal(&entry.shared_reads_per_second),
+                        observed_decimal(&entry.temp_blocks_per_second)
+                    ));
+                }
+                output.push_str("\nExecution ms/s measures summed completed execution time, not CPU utilization. Nested statement execution may overlap.\n\n");
+            }
+        }
+    }
+}
+
+fn health_sections(output: &mut String, snapshot: &Snapshot) {
+    output.push_str("## Database capacity and cumulative activity\n\n");
+    match &snapshot.health.database {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(db) => {
+            output.push_str("| Metric | Observed value |\n| --- | --- |\n");
+            for (label, value) in [
+                ("Database bytes", db.size_bytes),
+                ("Database connections", db.num_backends),
+                ("Cluster client backends", db.cluster_backends),
+                ("Max connections", db.max_connections),
+                ("Reserved connections", db.reserved_connections),
+                ("Commits (cumulative)", db.xact_commit),
+                ("Rollbacks (cumulative)", db.xact_rollback),
+                ("Deadlocks (cumulative)", db.deadlocks),
+                ("Recovery conflicts (cumulative)", db.conflicts),
+                ("Temporary files (cumulative)", db.temp_files),
+                ("Temporary bytes (cumulative)", db.temp_bytes),
+                ("Frozen XID age (transactions)", db.frozen_xid_age),
+            ] {
+                output.push_str(&format!("| {label} | {value} |\n"));
+            }
+            output.push_str(&format!("| Statistics reset | {} |\n| Autovacuum | {} |\n| Track counts | {} |\n| Track I/O timing | {} |\n\n", db.stats_reset.map(|time| time.to_rfc3339()).unwrap_or_else(|| "No reset recorded (observed SQL NULL)".into()), db.autovacuum, db.track_counts, db.track_io_timing));
+        }
+    }
+    output.push_str("## Tables and maintenance\n\nTuple counts and modifications are PostgreSQL estimates. They do not measure exact bloat or reclaimable disk. Missing maintenance timestamps can mean never recorded or unavailable. Relation sizes include different components as labeled.\n\n");
+    match &snapshot.health.tables {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(relations) => {
+            output.push_str(&format!(
+                "Table rows: {}. Index rows: {}. Ranking truncated: {}.\n\n",
+                relations.tables.len(),
+                relations.indexes.len(),
+                relations.truncated
+            ));
+            output.push_str("| Table | OID | Total bytes | Table bytes | Index bytes | Estimated live | Estimated dead | Modified since analyze | Frozen XID age |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+            for table in &relations.tables {
+                output.push_str(&format!(
+                    "| {}.{} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    escape(&table.schema),
+                    escape(&table.name),
+                    table.oid,
+                    table.total_bytes,
+                    table.table_bytes,
+                    table.index_bytes,
+                    table.live_tuples,
+                    table.dead_tuples,
+                    table.modified_since_analyze,
+                    table.frozen_xid_age
+                ));
+            }
+            output.push_str("\n| Table | Sequential scans (cumulative) | Index scans (cumulative) | Last vacuum | Last autovacuum | Last analyze | Last autoanalyze |\n| --- | --- | --- | --- | --- | --- | --- |\n");
+            for table in &relations.tables {
+                output.push_str(&format!(
+                    "| {}.{} | {} | {} | {} | {} | {} | {} |\n",
+                    escape(&table.schema),
+                    escape(&table.name),
+                    table.seq_scan,
+                    number(table.idx_scan),
+                    time(table.last_vacuum),
+                    time(table.last_autovacuum),
+                    time(table.last_analyze),
+                    time(table.last_autoanalyze)
+                ));
+            }
+            output.push_str("\n### Index usage and validity\n\nZero observed scans does not justify dropping an index: constraints, infrequent workloads, resets, and statistics scope matter.\n\n| Index | Table | OID | Bytes | Scans (cumulative) | Tuples read (cumulative) | Tuples fetched (cumulative) | Valid | Unique | Primary |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+            for index in &relations.indexes {
+                output.push_str(&format!(
+                    "| {}.{} | {}.{} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    escape(&index.schema),
+                    escape(&index.name),
+                    escape(&index.schema),
+                    escape(&index.table),
+                    index.oid,
+                    index.size_bytes,
+                    index.scans,
+                    index.tuples_read,
+                    index.tuples_fetched,
+                    index.valid,
+                    index.unique,
+                    index.primary
+                ));
+            }
+            output.push('\n');
+        }
+    }
+    output.push_str("## Vacuum progress\n\n");
+    match &snapshot.health.vacuum {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(rows) => {
+            if rows.is_empty() {
+                output.push_str("No active vacuum progress rows observed. This does not prove maintenance is sufficient.\n\n");
+            } else {
+                output.push_str("| PID | Table OID | Phase | Heap blocks total | Scanned | Vacuumed |\n| --- | --- | --- | --- | --- | --- |\n");
+                for row in rows {
+                    output.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} |\n",
+                        row.pid,
+                        row.table_oid,
+                        escape(&row.phase),
+                        row.heap_blocks_total,
+                        row.heap_blocks_scanned,
+                        row.heap_blocks_vacuumed
+                    ));
+                }
+                output.push('\n');
+            }
+        }
+    }
+    output.push_str("## Replication and WAL retention\n\nByte gaps and retained WAL are gauges. Time since last replay can increase on an idle primary and does not by itself prove replica lag. Cluster observations may include consumers for other databases.\n\n");
+    match &snapshot.health.replication {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(replication) => {
+            output.push_str(&format!("In recovery: {}. Received-to-replay gap: {} bytes. Seconds since last replayed transaction: {}.\n\n", replication.in_recovery, number(replication.receive_replay_lag_bytes), replication.replay_delay_seconds.map(decimal).unwrap_or_else(|| "Unavailable / NULL".into())));
+            replica_table(output, &replication.senders);
+            output.push_str("| Slot | Type | Database | Active | Retained bytes | WAL status | Safe WAL size (bytes) |\n| --- | --- | --- | --- | --- | --- | --- |\n");
+            for slot in &replication.slots {
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} |\n",
+                    escape(&slot.name),
+                    escape(&slot.slot_type),
+                    optional(slot.database.as_deref()),
+                    slot.active,
+                    number(slot.retained_bytes),
+                    optional(slot.wal_status.as_deref()),
+                    number(slot.safe_wal_size)
+                ));
+            }
+            output.push('\n');
+        }
+    }
+    output.push_str("## Cluster WAL counters\n\n");
+    match &snapshot.health.wal {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(wal) => {
+            output.push_str(&format!("| Records | Full-page images | Bytes | Buffer-full events | Statistics reset |\n| --- | --- | --- | --- | --- |\n| {} | {} | {} | {} | {} |\n\n", wal.records, wal.full_page_images, decimal(wal.bytes), wal.buffers_full, time(wal.stats_reset)));
+        }
+    }
+    output.push_str("## Cluster I/O counters\n\nCounters are cumulative within each backend/object/context group and cover the cluster. NULL means unavailable or inapplicable. I/O operation counts are not bytes. Timing is collected only when the applicable track_io_timing or track_wal_io_timing setting is enabled, and is not a utilization percentage.\n\n");
+    match &snapshot.health.io {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(rows) => {
+            output.push_str("| Backend | Object | Context | Reads | Writes | Read ms | Write ms | Hits | Evictions | Fsyncs | Statistics reset |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+            for row in rows {
+                let timed = |value: Option<f64>| {
+                    value
+                        .map(decimal)
+                        .unwrap_or_else(|| "Unavailable / NULL".into())
+                };
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    escape(&row.backend_type),
+                    escape(&row.object),
+                    escape(&row.context),
+                    number(row.reads),
+                    number(row.writes),
+                    timed(row.read_time_ms),
+                    timed(row.write_time_ms),
+                    number(row.hits),
+                    number(row.evictions),
+                    number(row.fsyncs),
+                    time(row.stats_reset)
+                ));
+            }
+            output.push('\n');
+        }
+    }
+}
+
+fn replica_table(output: &mut String, replicas: &[crate::model::Replica]) {
+    if replicas.is_empty() {
+        output.push_str("No WAL sender rows observed.\n\n");
+        return;
+    }
+    output.push_str("| Sender PID | Application | State | Sync state | Sent-to-replay bytes | Replay lag (ms) |\n| --- | --- | --- | --- | --- | --- |\n");
+    for replica in replicas {
+        output.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            replica.pid,
+            escape(&replica.application),
+            optional(replica.state.as_deref()),
+            optional(replica.sync_state.as_deref()),
+            number(replica.sent_replay_lag_bytes),
+            replica
+                .replay_lag_ms
+                .map(decimal)
+                .unwrap_or_else(|| "Unavailable / NULL".into())
+        ));
+    }
+    output.push('\n');
+}
+
+fn health_comparison_sections(output: &mut String, comparison: &Comparison) {
+    output.push_str("## Database changes\n\n");
+    match &comparison.health.database {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(db) => {
+            output.push_str(&format!("| Gauge | Before | After | Change |\n| --- | --- | --- | --- |\n| Database bytes | {} | {} | {} |\n| Database connections | {} | {} | {} |\n| Cluster client backends | {} | {} | {} |\n\n", db.size_bytes_before, db.size_bytes_after, observed(&db.size_delta_bytes), db.connections_before, db.connections_after, db.connections_after.saturating_sub(db.connections_before), db.cluster_connections_before, db.cluster_connections_after, db.cluster_connections_after.saturating_sub(db.cluster_connections_before)));
+        }
+    }
+    output.push_str("## Relation changes\n\n");
+    match &comparison.health.relations {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(relations) => {
+            for caveat in &relations.caveats {
+                output.push_str(&format!("- {}\n", escape(caveat)));
+            }
+            output.push_str(&format!(
+                "\nRanking truncated before: {}. After: {}.\n\n",
+                relations.before_truncated, relations.after_truncated
+            ));
+            output.push_str("| Table OID | Before name | After name | Size change (bytes) | Estimated live change | Estimated dead change | Sequential scan delta | Index scan delta | Inserts | Updates | Deletes |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+            for table in &relations.tables {
+                let name = |row: Option<&crate::model::TableStats>| {
+                    row.map(|row| format!("{}.{}", escape(&row.schema), escape(&row.name)))
+                        .unwrap_or_else(|| "Not observed".into())
+                };
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    table.oid,
+                    name(table.before.as_ref()),
+                    name(table.after.as_ref()),
+                    observed(&table.size_delta_bytes),
+                    observed(&table.estimated_live_tuple_change),
+                    observed(&table.estimated_dead_tuple_change),
+                    observed(&table.sequential_scans),
+                    observed(&table.index_scans),
+                    observed(&table.inserts),
+                    observed(&table.updates),
+                    observed(&table.deletes)
+                ));
+            }
+            output.push_str("\n| Index OID | Before name | After name | Size change (bytes) | Scans | Tuples read | Tuples fetched |\n| --- | --- | --- | --- | --- | --- | --- |\n");
+            for index in &relations.indexes {
+                let name = |row: Option<&crate::model::IndexStats>| {
+                    row.map(|row| format!("{}.{}", escape(&row.schema), escape(&row.name)))
+                        .unwrap_or_else(|| "Not observed".into())
+                };
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} |\n",
+                    index.oid,
+                    name(index.before.as_ref()),
+                    name(index.after.as_ref()),
+                    observed(&index.size_delta_bytes),
+                    observed(&index.scans),
+                    observed(&index.tuples_read),
+                    observed(&index.tuples_fetched)
+                ));
+            }
+            output.push('\n');
+        }
+    }
+    output.push_str("## Replication changes\n\n");
+    match &comparison.health.replication {
+        Observation::Unavailable(reason) => unavailable(output, reason),
+        Observation::Available(replication) => {
+            for caveat in &replication.caveats {
+                output.push_str(&format!("- {}\n", escape(caveat)));
+            }
+            output.push_str(&format!("\nRecovery state before: {}. After: {}. Received-to-replay byte gap change: {}.\n\n", replication.in_recovery_before, replication.in_recovery_after, observed(&replication.received_replay_backlog_delta_bytes)));
+            output.push_str("| Slot | Observed before | Observed after | Active before | Active after | Retained before | Retained after | Retained byte change |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+            for slot in &replication.slots {
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    escape(&slot.name),
+                    slot.before.is_some(),
+                    slot.after.is_some(),
+                    slot.before
+                        .as_ref()
+                        .map(|row| row.active.to_string())
+                        .unwrap_or_else(|| "Not observed".into()),
+                    slot.after
+                        .as_ref()
+                        .map(|row| row.active.to_string())
+                        .unwrap_or_else(|| "Not observed".into()),
+                    number(slot.before.as_ref().and_then(|row| row.retained_bytes)),
+                    number(slot.after.as_ref().and_then(|row| row.retained_bytes)),
+                    observed(&slot.retained_delta_bytes)
+                ));
+            }
+            output.push_str("\n### Sender observations before\n\n");
+            replica_table(output, &replication.senders_before);
+            output.push_str("### Sender observations after\n\n");
+            replica_table(output, &replication.senders_after);
+        }
+    }
+}
+
+fn time(value: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    value
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| "Unavailable / NULL".into())
 }
 
 fn warnings(output: &mut String, warnings: &[String]) {
@@ -532,5 +970,59 @@ mod tests {
         assert!(statements.contains("Unavailable"));
         assert!(!statements.contains("Added"));
         assert!(!statements.contains("Removed"));
+    }
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+    use crate::compare::{compare, tests::snapshot};
+    use chrono::Duration;
+
+    #[test]
+    fn analysis_export_contains_evidence_interpretation_steps_and_unknown_coverage() {
+        let mut snapshot = snapshot();
+        snapshot.health.io = Observation::Unavailable("restricted visibility".into());
+        let report = analysis_markdown(&diagnostics::analyze(&snapshot, None));
+        assert!(report.contains("Evidence:"));
+        assert!(report.contains("Inference:"));
+        assert!(report.contains("Next:"));
+        assert!(report.contains("restricted visibility"));
+        assert!(report.contains("A previous capture is required"));
+    }
+
+    #[test]
+    fn table_and_replication_names_cannot_inject_markdown_or_terminal_sequences() {
+        let mut snapshot = snapshot();
+        if let Observation::Available(relations) = &mut snapshot.health.tables {
+            relations.tables[0].name = "orders|<script>\n# injected\u{1b}".into();
+            relations.indexes[0].name = "index\u{202e}[x]".into();
+            relations.indexes[0].valid = false;
+        }
+        let report = snapshot_markdown(&snapshot);
+        assert!(!report.contains("<script>"));
+        assert!(!report.contains('\u{1b}'));
+        assert!(!report.contains('\u{202e}'));
+        assert!(report.contains("orders\\|&lt;script&gt;"));
+        assert!(report.contains("Index usage and validity"));
+        assert!(report.contains("Cluster I/O counters"));
+        assert!(report.contains("Replication and WAL retention"));
+    }
+
+    #[test]
+    fn comparison_has_inspectable_health_deltas_and_unavailable_legacy_sections() {
+        let mut before = snapshot();
+        before.schema_version = 1;
+        before.health = Default::default();
+        let mut after = before.clone();
+        after.schema_version = 2;
+        after.health = crate::demo::snapshot(0, false).health;
+        after.started_at += Duration::seconds(10);
+        after.completed_at += Duration::seconds(10);
+        let report = comparison_markdown(&compare(&before, &after));
+        assert!(report.contains("## Relation changes"));
+        assert!(report.contains("## Replication changes"));
+        assert!(report.contains("Not collected in this snapshot"));
+        assert!(report.contains("| Calls | 10 | 10 | 0 |"));
     }
 }

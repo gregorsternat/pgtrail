@@ -40,11 +40,20 @@ jobs:
         run: cargo test --locked
       - name: Build
         run: cargo build --locked
+      - name: Verify terminal and recording workflows
+        run: python3 scripts/check-terminal.py
 
   postgres:
-    name: PostgreSQL integration
+    name: PostgreSQL ${{ matrix.postgres }} integration
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [16, 17, 18]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PGTRAIL_POSTGRES_VERSION: ${{ matrix.postgres }}
+      COMPOSE_PROJECT_NAME: pgtrail-ci-${{ matrix.postgres }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Start PostgreSQL
@@ -53,7 +62,7 @@ jobs:
         run: sh scripts/check-db.sh
       - name: Install the repository toolchain
         run: rustup show active-toolchain
-      - name: Test the collector against PostgreSQL 18
+      - name: Test the collector against PostgreSQL ${{ matrix.postgres }}
         env:
           PGTRAIL_LIVE_TEST: "1"
         run: cargo test --locked --lib -- --ignored --test-threads=1

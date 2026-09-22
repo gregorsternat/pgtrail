@@ -1,6 +1,6 @@
 [package]
 name = "pgtrail"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.98.1"
 description = "A terminal tool for PostgreSQL diagnostics and snapshot comparison"
