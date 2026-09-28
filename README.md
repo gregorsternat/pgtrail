@@ -1,5 +1,7 @@
 # pgtrail
 
+<!-- owner: maintainers; reviewed: 2026-09-28 -->
+
 A Rust terminal application for daily PostgreSQL investigation. Follow blocking
 transactions, identify expensive workloads, inspect maintenance and replication,
 and keep an annotated local record of an incident before and after a change.
@@ -325,10 +327,13 @@ commands are in [Contributing](CONTRIBUTING.md).
 | Lint | `cargo clippy --locked --all-targets -- -D warnings` |
 | Unit and CLI tests, no PostgreSQL | `cargo test --locked` |
 | Build | `cargo build --locked` |
-| All Rust checks | `just check` |
+| All local checks, including docs and synthetic terminal workflows | `just check` |
+| Documentation links, ownership, and freshness | `just docs-check` |
+| Architecture boundaries | `just architecture-check` |
 | Fixture privileges | `sh scripts/check-db.sh` |
 | Live collector tests, disposable fixture only | `PGTRAIL_LIVE_TEST=1 cargo test --locked --lib -- --ignored --test-threads=1` |
 
+[Knowledge index](docs/index.md) maps the repository guides, plans, and quality evidence.
 [Architecture](docs/architecture.md) covers data flow and invariants.
 [Roadmap](docs/roadmap.md) tracks delivered scope and future acceptance criteria.
 [Contributing](CONTRIBUTING.md) covers validation and repository conventions.

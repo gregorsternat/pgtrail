@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * 1"
 
 permissions:
   contents: read
@@ -13,7 +16,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  knowledge:
+    name: Repository knowledge
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Test documentation guardrails
+        run: python3 -B scripts/test-check-docs.py
+      - name: Check documentation links and review dates
+        run: python3 -B scripts/check-docs.py
+
   rust:
+    if: github.event_name != 'schedule'
     name: Rust (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -44,6 +59,7 @@ jobs:
         run: python3 scripts/check-terminal.py
 
   postgres:
+    if: github.event_name != 'schedule'
     name: PostgreSQL ${{ matrix.postgres }} integration
     strategy:
       fail-fast: false
