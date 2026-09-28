@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test documentation guardrails
         run: python3 -B scripts/test-check-docs.py
       - name: Check documentation links and review dates
@@ -37,7 +37,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the repository toolchain
         run: rustup show active-toolchain
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -71,7 +71,7 @@ jobs:
       PGTRAIL_POSTGRES_VERSION: ${{ matrix.postgres }}
       COMPOSE_PROJECT_NAME: pgtrail-ci-${{ matrix.postgres }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Start PostgreSQL
         run: docker compose up -d --wait
       - name: Verify monitoring privileges
