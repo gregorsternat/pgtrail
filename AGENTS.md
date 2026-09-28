@@ -1,77 +1,58 @@
 # Working on pgtrail
 
-## Start here
+<!-- owner: maintainers; reviewed: 2026-09-28 -->
 
-- pgtrail is a Rust TUI for PostgreSQL investigation and local snapshot comparison.
-- Read the README for implemented behavior; do not describe roadmap items as shipped.
-- The v1.1 binary connects read-only to PostgreSQL 16–18, saves local SQLite snapshots,
-  and compares them offline; `--demo` uses explicitly synthetic data.
-- Keep code, documentation, user-facing text, commits, and PR descriptions in English.
-- Inspect the relevant code and existing changes before editing.
-- Keep each change focused on one coherent outcome.
+pgtrail is a Rust TUI for read-only PostgreSQL investigation and local snapshot
+comparison. Keep code, documentation, UI text, commits, and PRs in English.
+Inspect the relevant code and existing changes before editing. Keep each change
+focused on one coherent outcome.
 
-## Read only what the task needs
+## Find the source of truth
 
-- Setup and commands: `README.md`.
-- Boundaries, data flow, and technology decisions: `docs/architecture.md`.
-- Feature scope and acceptance criteria: `docs/roadmap.md`.
-- Contribution workflow and manual checks: `CONTRIBUTING.md`.
-- PostgreSQL fixture and permissions: `dev/postgres/init.sh` and `scripts/check-db.sh`.
-- Use the documentation for the dependency versions in `Cargo.lock`.
+Start with the [knowledge index](docs/index.md), then read only what the task needs:
 
-## Commands
+- Implemented behavior and commands: [README](README.md). Roadmap items are not shipped.
+- Boundaries, data flow, and decisions: [architecture](docs/architecture.md).
+- Future scope and acceptance criteria: [roadmap](docs/roadmap.md).
+- Rust conventions, checks, and review: [Contributing](CONTRIBUTING.md).
+- Complex work and decision logs: [execution plans](docs/plans.md).
+- Coverage and known gaps: [quality](docs/quality.md) and [debt](docs/exec-plans/tech-debt-tracker.md).
+- Disposable database setup: [fixture](dev/postgres/init.sh) and [privilege check](scripts/check-db.sh).
+- Dependency versions: [Cargo.lock](Cargo.lock); use their matching documentation.
 
-- Run: `cargo run --locked` (requires an interactive terminal).
-- CLI help: `cargo run --locked -- --help`.
-- Format: `cargo fmt --all`.
-- Check: `just check`, or the following equivalent commands:
-  - `cargo fmt --all -- --check`
-  - `cargo clippy --locked --all-targets -- -D warnings`
-  - `cargo test --locked`
-  - `cargo build --locked`
-- Start the local database: `docker compose up -d --wait`.
-- Validate database setup: `sh scripts/check-db.sh`.
-- Stop it without deleting data: `docker compose down`.
-- Rust checks must work without PostgreSQL running.
+## Non-negotiable boundaries
 
-## Implementation boundaries
-
-- Keep one package until a concrete need justifies extracting a crate.
-- Keep `main` thin; orchestration belongs in the library.
-- Translate terminal input into messages; update state separately from rendering.
-- Rendering must not perform database, filesystem, or network I/O.
+- Keep one package and a thin main; orchestration belongs in the library.
+- Input becomes messages; state updates and rendering stay separate.
+- Rendering performs no database, filesystem, or network I/O. Database I/O is async.
 - PostgreSQL collection and SQLite persistence are separate responsibilities.
-- Keep database I/O asynchronous and outside the rendering path.
-- Create modules when functionality needs them, not as empty placeholders.
-- Do not introduce a public API or trait solely for hypothetical reuse.
+- Observe PostgreSQL 16–18 with a non-superuser, read-only account. Never create
+  extensions, reset statistics, or cancel sessions on a monitored server.
+- Provisioning SQL belongs only in the disposable development fixture.
+- Unavailable data differs from zero, NULL, empty results, and a healthy state.
+- Current query duration differs from cumulative statement statistics.
+- Comparisons must handle counter resets and incompatible sources.
+- Do not log credentials, connection strings, or sensitive SQL by default.
+- Keep captured data and local settings out of version control. Demo data is synthetic.
+- Use the pinned Rust toolchain, rustfmt, and Clippy. `unsafe` is forbidden.
+- Return contextual errors for recoverable failures; use narrow visibility and
+  concrete types. Add dependencies or abstractions only for a present need.
+- Test observable behavior and failure cases; do not mirror the implementation.
+- Do not weaken a guardrail to silence a failure. Fix the boundary or document and
+  review a concrete exception with its test and debt entry.
 
-## Rust conventions
+## Work and verify
 
-- Use the pinned toolchain, edition 2024, standard rustfmt, and Clippy.
-- `unsafe` is forbidden in project code.
-- Return errors with context; do not panic on recoverable input or I/O failures.
-- Prefer concrete types, enums, private fields, and narrow visibility.
-- Use `anyhow` at the application boundary; introduce typed domain errors as needed.
-- Do not add broad lint suppressions; justify narrow exceptions inline.
-- Add dependencies only for code that uses them, and version the lockfile changes.
-- Test observable behavior and failure cases rather than mirroring implementation.
-
-## PostgreSQL and data invariants
-
-- Observe the target database in read-only mode using a non-superuser account.
-- Never create extensions, reset statistics, or cancel sessions on a monitored server.
-- Provisioning SQL belongs only in the disposable local development fixture.
-- Unavailable data is distinct from zero, NULL, an empty result, or a healthy state.
-- Current query duration and cumulative statement statistics are different metrics.
-- Snapshot comparisons must account for counter resets and incompatible sources.
-- Do not log credentials, connection strings, or sensitive SQL text by default.
-- Keep captured data and local settings out of version control.
-
-## Finish a change
-
-- Run the relevant checks and report exactly what passed and what was not verified.
-- For terminal lifecycle changes, check quit, Ctrl+C, resize, and terminal restoration.
-- For database setup changes, run the Compose smoke check.
-- Update the single relevant guide when behavior, commands, or a decision changes.
-- Use short scoped Conventional Commits, for example `feat(activity): show sessions`.
-- Do not add agent transcripts, generic Rust tutorials, or duplicate instruction files.
+- Use a versioned plan for complex work; update decisions and evidence as it progresses.
+- Run `just check` for documentation, format, Clippy, tests, build, and synthetic PTY
+  checks without PostgreSQL. Equivalent commands are in Contributing.
+- Run `just docs-check` for focused documentation work; `just architecture-check`
+  checks module boundaries. Both are enforced in CI.
+- For terminal changes, also inspect the demo visually and check quit, Ctrl+C,
+  resize, and terminal restoration.
+- For collector/fixture changes, run the disposable database checks in Contributing.
+- Update the owning guide when behavior or decisions change. Keep the knowledge
+  index, quality gaps, and plan links current; record repeated failures as tests.
+- Review the final diff and report exactly what passed and what remains unverified.
+- Use short scoped Conventional Commits, e.g. `feat(activity): show sessions`.
+- Do not add agent transcripts, generic tutorials, or duplicate instruction files.

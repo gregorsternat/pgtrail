@@ -1,5 +1,7 @@
 # Architecture
 
+<!-- owner: maintainers; reviewed: 2026-09-28 -->
+
 pgtrail is one Rust 2024 package with a thin binary entry point and an internal
 library. Rust 1.98.1 is pinned; `Cargo.lock` is committed. Runtime dependencies serve
 implemented capabilities: Tokio, SQLx 0.9 with PostgreSQL/SQLite and Rustls,
@@ -42,7 +44,36 @@ PostgreSQL 16–18 -> async collector -> versioned observations
 | Explicitly synthetic observations | `demo.rs` |
 | Input-driven state transitions and bounded trend state | `app.rs` |
 | Terminal events and restoration | `event.rs`, `terminal.rs` |
-| Rendering without database, filesystem, or network I/O | `ui.rs`, `ui/investigation.rs` |
+| Rendering without database, filesystem, or network I/O | `ui.rs`, `ui/details.rs`, `ui/investigation.rs` |
+
+## Enforced boundaries
+
+[Architecture tests](../tests/architecture.rs) parse production Rust modules with
+Syn and run as part of `cargo test --locked`. New top-level modules must declare
+their permitted dependencies in the test. Failures name the edge and suggest moving
+I/O to the owning adapter or orchestration layer.
+
+| Area | Permitted internal dependencies |
+| --- | --- |
+| Model, profiles, CLI, event, terminal | No other application module |
+| Collector, store, synthetic demo | Model |
+| Comparison, metrics, diagnostics | Model and existing analysis edges recorded in the test |
+| Reports and incidents | Pure analysis, model, report helpers, and named store records |
+| App state and UI | Model, analysis, presentation helpers, named store records, and input messages |
+| Library runner, commands, runtime | Composition roots coordinate application modules |
+
+The pure modules reject direct SQLx/Tokio access, standard filesystem/network/I/O,
+process/environment/thread access, terminal output macros, and adapter service
+imports. App state may use Crossterm event values; it may import only `Message`
+from the event adapter. Pure consumers may import specific incident/capture records
+from store, never `Store` or a wildcard. Test-only modules can use fixtures and I/O.
+
+These are syntax guardrails, not call-graph analysis or a proof of purity. Expanded
+macro bodies, re-exported APIs, and indirect side effects still require review and
+behavioral tests. The existing app/UI cycle, analysis cycle, and shared store records
+are tracked with completion criteria in [technical debt](exec-plans/tech-debt-tracker.md).
+Changing an allowed edge requires updating this guide and the regression fixtures;
+do not expand the allowlist simply to make a failing check pass.
 
 ## Runtime and terminal
 
