@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["macros", "rt", "signal", "time", "sync", "
 url = "2"
 
 [dev-dependencies]
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 tempfile = "3"
 
 [lints.rust]
