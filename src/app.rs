@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod incident_tests;
+mod interaction;
 mod navigation;
+pub(crate) use interaction::{Command, CommandId, Focus, NAVIGATION, Overlay, ReportKind};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -69,13 +71,17 @@ impl Tab {
             Self::Activity => "Activity",
             Self::Blocking => "Blocking",
             Self::Statements => "Statements",
-            Self::History => "History",
+            Self::History => "Captures",
             Self::Database => "Database",
             Self::Relations => "Relations",
             Self::Replication => "Replication",
             Self::Io => "I/O",
             Self::Incidents => "Incidents",
         }
+    }
+
+    pub(crate) fn shortcut(self) -> &'static str {
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"][self.index()]
     }
 }
 
@@ -121,7 +127,24 @@ pub(crate) struct TrendPoint {
 }
 
 #[derive(Debug)]
+pub(crate) struct ComparisonContext {
+    pub(crate) before: SnapshotSummary,
+    pub(crate) after: SnapshotSummary,
+    pub(crate) synthetic: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct App {
+    pub(crate) theme: crate::ui::Theme,
+    pub(crate) mouse_enabled: bool,
+    pub(crate) connection_configured: bool,
+    pub(crate) focus: Focus,
+    pub(crate) overlay: Overlay,
+    pub(crate) menu_cursor: usize,
+    pub(crate) table_offsets: [usize; 10],
+    pub(crate) report_kind: ReportKind,
+    pub(crate) comparison: Option<ComparisonContext>,
+    pub(crate) help_all: bool,
     should_quit: bool,
     snapshot: Option<Snapshot>,
     paused: bool,
@@ -146,6 +169,7 @@ pub(crate) struct App {
     pub(crate) notice: Option<String>,
     pub(crate) sort: StatementSort,
     pub(crate) history: Vec<SnapshotSummary>,
+    pub(crate) history_error: Option<String>,
     pub(crate) compare_a: Option<i64>,
     pub(crate) compare_b: Option<i64>,
     pub(crate) report: Option<String>,
@@ -159,6 +183,7 @@ pub(crate) struct App {
     pub(crate) show_indexes: bool,
     pub(crate) relation_sort: usize,
     pub(crate) incidents: Vec<crate::store::IncidentSummary>,
+    pub(crate) incidents_error: Option<String>,
     pub(crate) incident: Option<crate::store::Incident>,
     pub(crate) active_incident: Option<i64>,
     pub(crate) prompt: Option<Prompt>,
@@ -169,6 +194,16 @@ pub(crate) struct App {
 impl App {
     pub(crate) fn new(demo: bool) -> Self {
         Self {
+            theme: crate::ui::Theme::Dark,
+            mouse_enabled: true,
+            connection_configured: true,
+            focus: Focus::Content,
+            overlay: Overlay::None,
+            menu_cursor: 0,
+            table_offsets: [0; 10],
+            report_kind: ReportKind::Comparison,
+            comparison: None,
+            help_all: false,
             should_quit: false,
             snapshot: None,
             paused: false,
@@ -193,6 +228,7 @@ impl App {
             notice: None,
             sort: StatementSort::Total,
             history: Vec::new(),
+            history_error: None,
             compare_a: None,
             compare_b: None,
             report: None,
@@ -206,6 +242,7 @@ impl App {
             show_indexes: false,
             relation_sort: 0,
             incidents: Vec::new(),
+            incidents_error: None,
             incident: None,
             active_incident: None,
             prompt: None,
@@ -301,6 +338,7 @@ impl App {
     }
 
     pub(crate) fn set_history(&mut self, history: Vec<SnapshotSummary>) {
+        self.history_error = None;
         let selected_id = self
             .filtered_history()
             .get(self.selected[Tab::History.index()])
@@ -315,10 +353,8 @@ impl App {
     }
 
     pub(crate) fn set_report(&mut self, report: String) {
-        self.report_title = "Offline comparison";
-        self.report = Some(report);
-        self.report_scroll = 0;
-        self.loading = false;
+        self.comparison = None;
+        self.open_report(ReportKind::Comparison, "Offline comparison", report);
     }
 
     pub(crate) fn set_error(&mut self, error: String) {
@@ -350,6 +386,11 @@ impl App {
 
     pub(crate) fn update(&mut self, message: Message) -> Option<Action> {
         self.now = Utc::now();
+        if matches!(message, Message::Key(_) | Message::Mouse(_))
+            && let Some(request) = self.pending_capture_request
+        {
+            self.discard_pending_capture_return(request);
+        }
         match message {
             Message::Quit => {
                 self.should_quit = true;
@@ -357,13 +398,11 @@ impl App {
             }
             Message::Redraw => None,
             Message::Key(key) => self.key(key),
+            Message::Mouse(event) => self.mouse(event),
         }
     }
 
-    fn key(&mut self, key: KeyEvent) -> Option<Action> {
-        if let Some(request) = self.pending_capture_request {
-            self.discard_pending_capture_return(request);
-        }
+    fn domain_key(&mut self, key: KeyEvent) -> Option<Action> {
         if self.prompt.is_some() {
             return self.edit_prompt(key);
         }
@@ -378,6 +417,9 @@ impl App {
             return None;
         }
         if self.help {
+            let (width, height) =
+                crate::ui::help_dimensions(self.viewport_width, self.viewport_height);
+            let page = usize::from(height.saturating_sub(2)).max(1);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => self.help = false,
                 KeyCode::Char('q') => self.should_quit = true,
@@ -387,15 +429,13 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.help_scroll = self.help_scroll.saturating_sub(1)
                 }
-                KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10),
-                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(page),
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
                 KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
                 KeyCode::End | KeyCode::Char('G') => self.help_scroll = usize::MAX,
                 _ => {}
             }
-            let (width, height) =
-                crate::ui::help_dimensions(self.viewport_width, self.viewport_height);
-            let count = crate::ui::help_lines(width.saturating_sub(2)).len();
+            let count = crate::ui::help_rows(self, width.saturating_sub(2)).len();
             self.help_scroll = self
                 .help_scroll
                 .min(count.saturating_sub(usize::from(height.saturating_sub(2))));
@@ -405,22 +445,13 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => {
                 self.help = true;
+                self.help_all = false;
                 self.help_scroll = 0;
             }
-            KeyCode::Tab | KeyCode::Right => return self.switch_tab((self.tab.index() + 1) % 10),
-            KeyCode::BackTab | KeyCode::Left => {
-                return self.switch_tab((self.tab.index() + 9) % 10);
-            }
-            KeyCode::Char('1'..='9') => {
-                if let KeyCode::Char(number) = key.code {
-                    return self.switch_tab(number as usize - '1' as usize);
-                }
-            }
-            KeyCode::Char('0') => return self.switch_tab(9),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::PageDown => self.move_selection(10),
-            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => self.move_selection(self.page_rows()),
+            KeyCode::PageUp => self.move_selection(-self.page_rows()),
             KeyCode::Home | KeyCode::Char('g') => self.move_selection(isize::MIN),
             KeyCode::End | KeyCode::Char('G') => self.move_selection(isize::MAX),
             KeyCode::Char('/') if self.filter_available() && self.report.is_none() => {
@@ -455,8 +486,8 @@ impl App {
             KeyCode::Char('b') if matches!(self.tab, Tab::Activity | Tab::Blocking) => {
                 self.follow_session(true)
             }
-            KeyCode::Char('[') if self.report.is_some() => self.report_section(false),
-            KeyCode::Char(']') if self.report.is_some() => self.report_section(true),
+            KeyCode::Char('[') => self.report_section(false),
+            KeyCode::Char(']') => self.report_section(true),
             KeyCode::Char('h') if self.analysis.is_some() => self.open_coverage(),
             KeyCode::Enter
                 if self.report.is_none()
@@ -466,8 +497,7 @@ impl App {
                     ) =>
             {
                 if let Some((title, text)) = crate::ui::detail_report(self) {
-                    self.set_report(text);
-                    self.report_title = title;
+                    self.open_report(ReportKind::Selection, title, text);
                 }
             }
             KeyCode::Char('i') => {
@@ -520,9 +550,11 @@ impl App {
                     let finding = (*finding).clone();
                     self.set_report(format!("# {}\n\n{source}\n\nSeverity: {:?}\n\n## Evidence\n\n{}\n\n## Interpretation\n\n{}\n\n## Next steps\n\n{}\n\n## Coverage and limits\n\n{coverage}", finding.title, finding.severity, finding.evidence.join("\n\n"), finding.interpretation, finding.next_steps.join("\n\n")));
                     self.report_title = "Finding details";
+                    self.report_kind = ReportKind::Selection;
                 } else if self.analysis.is_some() {
                     self.set_report(format!("# Coverage and limits\n\n{source}\n\nNo finding matches this view. Absence of findings does not establish database health.\n\n{coverage}"));
                     self.report_title = "Coverage and limits";
+                    self.report_kind = ReportKind::Coverage;
                 }
             }
             KeyCode::Enter
@@ -541,6 +573,7 @@ impl App {
                     }
                     self.set_report(format!("# Operator note\n\n{}", entry.detail));
                     self.report_title = "Incident note";
+                    self.report_kind = ReportKind::Note;
                 }
             }
             KeyCode::Enter if self.tab == Tab::Incidents && self.report.is_none() => {
@@ -632,6 +665,7 @@ impl App {
             KeyCode::Esc if self.report.is_some() => {
                 self.report = None;
                 self.report_scroll = 0;
+                self.focus = Focus::Content;
                 if !self.is_offline() {
                     return Some(Action::ResumeLive);
                 }
@@ -665,6 +699,8 @@ impl App {
         self.navigation.clear();
         self.filters[self.tab.index()] = self.filter.clone();
         self.tab = Tab::ALL[index];
+        self.focus = Focus::Content;
+        self.overlay = Overlay::None;
         self.filter = self.filters[self.tab.index()].clone();
         self.report = None;
         self.clamp_selection();
@@ -706,7 +742,7 @@ impl App {
     }
 
     fn move_selection(&mut self, movement: isize) {
-        if self.report.is_some() {
+        if self.report.is_some() && self.focus != Focus::Content {
             self.report_scroll = self
                 .report_scroll
                 .saturating_add_signed(movement)
@@ -737,16 +773,13 @@ impl App {
             Tab::Relations if self.show_indexes => self.filtered_indexes().len(),
             Tab::Relations => self.filtered_tables().len(),
             Tab::Incidents => self.filtered_incidents().len(),
-            Tab::Database => 40,
-            Tab::Replication => self
-                .snapshot()
-                .and_then(|s| s.health.replication.available())
-                .map_or(20, |r| (r.senders.len() + r.slots.len()) * 3 + 20),
-            Tab::Io => self.snapshot().map_or(20, |s| {
-                s.health.io.available().map_or(0, |rows| rows.len() * 2)
-                    + s.health.vacuum.available().map_or(0, |rows| rows.len() * 2)
-                    + 20
-            }),
+            Tab::Database | Tab::Replication | Tab::Io => {
+                let area = crate::ui::layout::Screen::for_app(self).content;
+                crate::ui::metric_rows(self, area.width.saturating_sub(2))
+                    .len()
+                    .saturating_sub(usize::from(area.height.saturating_sub(2)))
+                    + 1
+            }
         };
         self.selected[self.tab.index()] = self.selected().min(count.saturating_sub(1));
     }
@@ -861,11 +894,11 @@ impl App {
         match key.code {
             KeyCode::Esc => self.prompt = None,
             KeyCode::Enter => {
-                let prompt = self.prompt.take()?;
-                if prompt.value.trim().is_empty() {
+                if self.prompt.as_ref()?.value.trim().is_empty() {
                     self.notice = Some("Text cannot be empty.".into());
                     return None;
                 }
+                let prompt = self.prompt.take()?;
                 return Some(match prompt.kind {
                     PromptKind::Incident => Action::CreateIncident(prompt.value),
                     PromptKind::Note(id) => Action::NoteIncident(id, prompt.value),
@@ -911,6 +944,7 @@ impl App {
     }
 
     pub(crate) fn set_incidents(&mut self, incidents: Vec<crate::store::IncidentSummary>) {
+        self.incidents_error = None;
         let selected_id = self
             .filtered_incidents()
             .get(self.selected[Tab::Incidents.index()])
@@ -1387,8 +1421,10 @@ mod investigation_tests {
         key(&mut app, KeyCode::Char('0'));
         assert_eq!(app.tab, Tab::Incidents);
         key(&mut app, KeyCode::Tab);
-        assert_eq!(app.tab, Tab::Overview);
+        assert_eq!(app.tab, Tab::Incidents);
+        assert_eq!(app.focus, Focus::Sidebar);
         key(&mut app, KeyCode::BackTab);
         assert_eq!(app.tab, Tab::Incidents);
+        assert_eq!(app.focus, Focus::Content);
     }
 }

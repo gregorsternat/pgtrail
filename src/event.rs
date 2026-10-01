@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures_util::StreamExt;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -7,6 +9,7 @@ pub(crate) enum Message {
     Quit,
     Redraw,
     Key(KeyEvent),
+    Mouse(MouseEvent),
 }
 
 pub(crate) async fn next(events: &mut EventStream) -> Result<Message> {
@@ -37,6 +40,14 @@ fn translate(event: Event) -> Option<Message> {
             }
         }
         Event::Resize(_, _) => Some(Message::Redraw),
+        Event::Mouse(event)
+            if matches!(
+                event.kind,
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            Some(Message::Mouse(event))
+        }
         _ => None,
     }
 }
@@ -71,5 +82,30 @@ mod tests {
             None
         );
         assert_eq!(translate(Event::Resize(40, 10)), Some(Message::Redraw));
+    }
+
+    #[test]
+    fn mouse_clicks_and_wheels_are_messages_but_motion_and_release_are_ignored() {
+        use crossterm::event::MouseButton;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let event = MouseEvent {
+                kind,
+                column: 4,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            };
+            let expected = if matches!(kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
+                None
+            } else {
+                Some(Message::Mouse(event))
+            };
+            assert_eq!(translate(Event::Mouse(event)), expected);
+        }
     }
 }

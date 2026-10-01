@@ -15,6 +15,8 @@ fn help_works_without_a_terminal() -> std::io::Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: pgtrail"));
     assert!(stdout.contains("--demo"));
+    assert!(stdout.contains("--theme"));
+    assert!(stdout.contains("--no-mouse"));
     assert!(stdout.contains("offline comparisons"));
     Ok(())
 }
@@ -35,6 +37,21 @@ fn unknown_arguments_fail_with_usage() -> std::io::Result<()> {
     let output = command().arg("--does-not-exist").output()?;
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+    Ok(())
+}
+
+#[test]
+fn terminal_options_validate_the_theme_and_leave_headless_output_plain() -> std::io::Result<()> {
+    for theme in ["dark", "terminal"] {
+        let output = command()
+            .args(["--theme", theme, "--no-mouse", "--demo", "check"])
+            .output()?;
+        assert!(output.status.success());
+        assert!(!output.stdout.contains(&0x1b));
+    }
+    let output = command().args(["--theme", "unknown"]).output()?;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("dark, terminal"));
     Ok(())
 }
 

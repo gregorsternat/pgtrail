@@ -90,13 +90,33 @@ rejected. Profile names must contain 1–64 ASCII letters, digits, `.`, `_`, or 
 
 ## Investigate in the terminal
 
+The sidebar groups views into **Investigate**, **Monitor**, and **Workspace**.
+It stays visible from 100 columns; in narrower terminals, `F2` or **Menu** opens
+an overlay so the content keeps the full width. The two-line header identifies the
+source, database, observation age, and live, paused, saved, or frozen evidence mode.
+Synthetic demo data is always labeled.
+
+Use `Tab` / `Shift+Tab` to move focus between navigation, content, and the inspector.
+The focused panel has a cyan border. In navigation, arrows select a view and `Enter`
+opens it. Number shortcuts work from any panel. Click views, rows, filters, modes,
+and action buttons; the wheel scrolls the panel under the pointer. Every action is
+also available from the keyboard.
+
+`Ctrl+K` or **Commands** opens a searchable palette with shortcuts and reasons why
+an action is unavailable. The toolbar and footer show actions for the current view;
+`?` opens contextual help and `a` switches to the complete shortcut reference.
+
+The default dark theme uses a slate background and cyan highlights. Use
+`--theme terminal` to keep your terminal's default background and ANSI palette, or
+`--no-mouse` for keyboard-only use. These TUI options create no preferences file.
+
 | View | What to investigate |
 | --- | --- |
 | `1` Overview | Findings ordered by severity, evidence, interpretation, next checks, and coverage limits |
 | `2` Activity | Session identity, transaction age, active query age, and wait events |
 | `3` Blocking | Waiter/blocker relationships, transaction ages, and unresolved blockers |
 | `4` Statements | Cumulative workload rankings or valid interval calls, execution time, and reads |
-| `5` History | Saved observations, capture labels, offline inspection, and before/after comparison |
+| `5` Captures | Saved observations, capture labels, offline inspection, and before/after comparison |
 | `6` Database | Connection pressure, transaction rates, cache activity, temporary writes, WAL, and recent trends |
 | `7` Relations | Table/index sizes and usage, maintenance estimates, transaction ID age, and vacuum progress |
 | `8` Replication | Primary/standby state, sender backlog, and replication slot WAL retention |
@@ -105,7 +125,10 @@ rejected. Profile names must contain 1–64 ASCII letters, digits, `.`, `_`, or 
 
 | Key | Action |
 | --- | --- |
-| `1`–`9`, `0`, `Tab`, `Shift+Tab` | Switch views |
+| `1`–`9`, `0` | Open a view directly (numbers are unchanged) |
+| `Tab`, `Shift+Tab` | Focus the next / previous visible panel |
+| `F2` | Focus navigation, or open the menu on narrow terminals |
+| `Ctrl+K` | Search commands and views |
 | `↑` / `↓`, `j` / `k`, `PgUp` / `PgDn` | Select rows or scroll a report |
 | `/` | Edit this view's filter; `Enter` applies, `Esc` cancels. Report-only views and incident chronology have no filter |
 | `Enter` | Expand the selected finding, session, blocking relationship, statement or relation into scrollable details |
@@ -113,19 +136,19 @@ rejected. Profile names must contain 1–64 ASCII letters, digits, `.`, `_`, or 
 | `e` in Overview | Follow a finding to a reliably identified backend, relation or statement |
 | `b` / `w` in Activity or Blocking | Follow blocker / waiter relationships in the same observation |
 | `Backspace` | Return to the originating evidence and selection |
-| `[` / `]` in details or comparison | Jump to the previous / next section |
+| `[` / `]` in details, comparison, Database, Replication or I/O | Jump to the previous / next section |
 | `Home` / `End` | Reach the first / last row of a list, report or help |
 | `v` in Statements | Switch cumulative/interval metrics |
 | `s` in Statements | Rank by execution time, mean time, or calls |
 | `v` in Relations | Switch tables/indexes |
 | `s` in Relations | Cycle size, maintenance/validity, and scan rankings |
-| `r` | Refresh now; reload lists in History or Incidents |
+| `r` | Refresh now; reload lists in Captures or Incidents |
 | `p` | Pause or resume automatic collection |
 | `c` | Collect and save a fresh capture, attached to the active incident when selected |
-| `Enter` in History | Inspect the selected saved capture offline |
-| `a`, `b`, then `d` in History | Mark earlier/later captures and compare them |
-| `l` in History | Rename the selected capture |
-| `I` in History | Attach the selected capture to the active incident |
+| `Enter` in Captures | Inspect the selected saved capture offline |
+| `a`, `b`, then `d` in Captures | Mark **Before** / **After** captures, then **Compare** |
+| `l` in Captures | Rename the selected capture |
+| `I` in Captures | Attach the selected capture to the active incident |
 | `i` | Create an incident |
 | `n` | Add a note to the active incident |
 | `Enter` in Incidents | Open the complete chronology and activate an open incident; in the chronology, inspect a capture or the full note |
@@ -134,7 +157,7 @@ rejected. Profile names must contain 1–64 ASCII letters, digits, `.`, `_`, or 
 | `o` in Incidents | Close or reopen the selected incident |
 | `x` in Incidents | Clear the active capture target |
 | `Esc` | Close details, return from attached evidence, leave chronology, clear the view filter, or return live |
-| `?` | Show scrollable keyboard help; use arrows, page keys or Home/End |
+| `?`, then `a` | Show contextual help, then the full reference; use arrows, page keys or Home/End |
 | `q`, `Ctrl+C` | Quit and restore the terminal |
 
 Selections follow observed identities across refreshes: PID **and backend start** for
@@ -143,10 +166,17 @@ disappears or its backend identity cannot be verified, a notice explains the cha
 and the first visible row is selected. Filters are saved separately for each view;
 Statements matches explicitly captured SQL in both cumulative and interval modes.
 
-Details scroll through wrapped lines, including the end of long captured SQL.
+`Enter` opens a scrollable inspector for the selected item. From 140 columns it
+appears beside the content; in narrower terminals it replaces the content. `Esc`
+closes it and restores the list position. Details wrap to the displayed width,
+including full captured SQL. Database, Replication and I/O scroll by displayed
+lines; their section shortcuts jump to named headings.
+
 Contextual evidence navigation freezes the observation so following a blocker or
 waiter cannot silently switch to a newer sample. `Backspace` restores the originating
-view and selection; ordinary view switching leaves that navigation path. The header
+view, inspector position and selection. A breadcrumb shows the evidence path, and
+**Return to live** in the footer or command palette resumes the live observation.
+Ordinary view switching leaves that navigation path. The header
 keeps observation age visible at 80×24 and identifies an open capture by ID and label.
 Coverage distinguishes synthetic provenance, collection completeness, and interval
 readiness; complete collection does not establish database health.
@@ -203,7 +233,7 @@ unavailable. Closed incidents reject new notes or attachment changes until reope
 ```sh
 pgtrail incident list --json
 pgtrail incident attach 1 7           # Incident ID, then capture ID
-pgtrail incident detach 1 7           # Keeps the capture in History
+pgtrail incident detach 1 7           # Keeps the capture in Captures
 pgtrail incident reopen 1
 pgtrail annotate 7 --label 'Before pool adjustment' --note 'Observed queue growth'
 pgtrail incident show 1 --format json --output checkout-incident.json
@@ -326,6 +356,7 @@ commands are in [Contributing](CONTRIBUTING.md).
 | Unit and CLI tests, no PostgreSQL | `cargo test --locked` |
 | Build | `cargo build --locked` |
 | All Rust checks | `just check` |
+| TUI journeys at 80×24, 120×36 and 160×48, including mouse restoration | `python3 scripts/check-terminal.py` (after building) |
 | Fixture privileges | `sh scripts/check-db.sh` |
 | Live collector tests, disposable fixture only | `PGTRAIL_LIVE_TEST=1 cargo test --locked --lib -- --ignored --test-threads=1` |
 

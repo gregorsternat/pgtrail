@@ -1,14 +1,25 @@
 mod details;
 mod investigation;
+pub(crate) mod layout;
+#[cfg(test)]
+mod review;
+mod shell;
+mod theme;
+pub(crate) use shell::{
+    controls, editor_controls, help_rows, menu_items, overlay_controls, palette_area,
+};
+pub(crate) use theme::Theme;
+use theme::{ACCENT, BORDER, MUTED, SELECTED, SURFACE, WARNING};
 
 pub(crate) use details::detail_report;
+pub(crate) use investigation::metric_rows;
 
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
+    widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
 use crate::{
@@ -16,223 +27,8 @@ use crate::{
     model::{Observation, Session},
 };
 
-const ACCENT: Color = Color::Cyan;
-// Use the terminal's configured foreground for readable secondary text on both
-// light and dark themes. Status and selection also have textual markers.
-const MUTED: Color = Color::Reset;
-const WARNING: Color = Color::Yellow;
-
 pub(crate) fn render(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    if area.width < 24 || area.height < 8 {
-        frame.render_widget(
-            Paragraph::new("pgtrail\nExpand terminal\nq: quit  ?: help").wrap(Wrap { trim: false }),
-            area,
-        );
-        return;
-    }
-    let [header, tabs, body, message, filter, footer] = Layout::vertical([
-        Constraint::Length(if app.capture.is_some() { 3 } else { 2 }),
-        Constraint::Length(2),
-        Constraint::Min(0),
-        Constraint::Length(if app.error.is_some() || app.notice.is_some() {
-            2
-        } else {
-            0
-        }),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-
-    render_header(frame, header, app);
-    let [first_tabs, second_tabs] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(tabs);
-    for (offset, row) in [(0, first_tabs), (5, second_tabs)] {
-        let titles: Vec<Line<'_>> = Tab::ALL
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(5)
-            .map(|(index, tab)| Line::from(format!("{} {}", (index + 1) % 10, tab.title())))
-            .collect();
-        let selected = (offset..offset + 5)
-            .contains(&app.tab.index())
-            .then_some(app.tab.index().saturating_sub(offset));
-        frame.render_widget(
-            Tabs::new(titles)
-                .select(selected)
-                .highlight_style(Style::new().fg(ACCENT).bold())
-                .divider("│"),
-            row,
-        );
-    }
-    if let Some(report) = &app.report {
-        render_report(frame, body, app, report);
-    } else {
-        match app.tab {
-            Tab::Overview => investigation::overview(frame, body, app),
-            Tab::Activity => render_activity(frame, body, app),
-            Tab::Blocking => render_blocking(frame, body, app),
-            Tab::Statements => render_statements(frame, body, app),
-            Tab::History => render_history(frame, body, app),
-            Tab::Database => investigation::database(frame, body, app),
-            Tab::Relations => investigation::relations(frame, body, app),
-            Tab::Replication => investigation::replication(frame, body, app),
-            Tab::Io => investigation::io(frame, body, app),
-            Tab::Incidents => investigation::incidents(frame, body, app),
-        }
-    }
-    if let Some(error) = &app.error {
-        frame.render_widget(
-            Paragraph::new(format!(" Error: {}", clean(error)))
-                .fg(Color::Red)
-                .wrap(Wrap { trim: true }),
-            message,
-        );
-    } else if let Some(notice) = &app.notice {
-        frame.render_widget(
-            Paragraph::new(format!(" {}", clean(notice)))
-                .fg(WARNING)
-                .wrap(Wrap { trim: true }),
-            message,
-        );
-    }
-    let filter_text = if app.report.is_some() && app.has_return_path() {
-        " [ / ]: previous / next section  Home/End: first/last  Backspace: return".into()
-    } else if app.report.is_some() {
-        " [ / ]: previous / next section  Home/End: first/last".into()
-    } else if !app.filter_available() {
-        " j/k: scroll  Tab / 1–9,0: view  h: coverage".into()
-    } else if app.editing_filter {
-        format!(
-            " {} /{}▏  Enter: apply  Esc: cancel  Ctrl+U: clear",
-            app.tab.title(),
-            app.filter
-        )
-    } else if !app.filter.is_empty() {
-        format!(
-            " {} filter: {}  /: edit  Esc: clear",
-            app.tab.title(),
-            app.filter
-        )
-    } else {
-        format!(
-            " /: filter {}  j/k: select  Tab / 1–9,0: view",
-            app.tab.title()
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(filter_text).fg(if app.editing_filter { ACCENT } else { MUTED }),
-        filter,
-    );
-    let footer_text = if app.report.is_some() && app.tab == Tab::Overview {
-        " ↑/↓ PgUp/PgDn: scroll  e: evidence  Esc: close  ?: help  q: quit"
-    } else if app.report.is_some() && matches!(app.tab, Tab::Activity | Tab::Blocking) {
-        " ↑/↓ PgUp/PgDn: scroll  b/w: blocker/waiter  Esc: close  ?: help"
-    } else if app.report.is_some() {
-        " ↑/↓ PgUp/PgDn: scroll  Esc: close  ?: help  q: quit"
-    } else if app.tab == Tab::History {
-        " Enter: inspect  a/b: mark  d: compare  l: label  I: attach  ?: help"
-    } else if app.tab == Tab::Incidents {
-        " Enter: inspect  e/E: export md/json  t: list/timeline  n: note  ?: help"
-    } else if app.tab == Tab::Relations {
-        " Enter: full details  v: tables/indexes  s: sort  c: capture  ?: help"
-    } else if app.tab == Tab::Statements {
-        " Enter: full details  v: cumulative/interval  s: sort  c: capture  ?: help"
-    } else if matches!(app.tab, Tab::Activity | Tab::Blocking) && app.has_return_path() {
-        " Enter: full details  b/w: blocker/waiter  Backspace: return  ?: help"
-    } else if matches!(app.tab, Tab::Activity | Tab::Blocking) {
-        " Enter: full details  b/w: blocker/waiter  c: capture  ?: help  q: quit"
-    } else if app.tab == Tab::Overview {
-        " Enter: finding  e: evidence  h: coverage  c: capture  ?: help  q: quit"
-    } else if app.is_offline() {
-        " OFFLINE  Esc: return to live  5: history  ?: help  q: quit"
-    } else {
-        " r: refresh  p: pause  c: capture  5: history  ?: help  q: quit"
-    };
-    frame.render_widget(Paragraph::new(footer_text).fg(ACCENT), footer);
-    if app.help {
-        render_help(frame, area, app.help_scroll);
-    }
-    if app.prompt.is_some() {
-        investigation::prompt(frame, area, app);
-    }
-}
-
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let comparison = app.report.is_some() && app.report_title == "Offline comparison";
-    let report_status = app.report_title.to_uppercase();
-    let (status, color) = if app.report.is_some() && !comparison {
-        (report_status.as_str(), ACCENT)
-    } else if comparison {
-        ("OFFLINE COMPARISON", WARNING)
-    } else if app.capture.is_none() && app.has_return_path() {
-        ("FROZEN EVIDENCE", WARNING)
-    } else if app.is_offline() {
-        ("OFFLINE CAPTURE", WARNING)
-    } else if app.demo {
-        ("DEMO · SYNTHETIC DATA", Color::Magenta)
-    } else if app.error.is_some() && app.snapshot().is_some() {
-        ("STALE · COLLECTION FAILED", Color::Red)
-    } else if app.error.is_some() {
-        ("DISCONNECTED", Color::Red)
-    } else if app.snapshot().is_none() && app.loading {
-        ("CONNECTING", WARNING)
-    } else if app.snapshot().is_none() {
-        ("NO LIVE CONNECTION", WARNING)
-    } else if app.paused() {
-        ("PAUSED", WARNING)
-    } else {
-        ("LIVE · CONNECTED", Color::Green)
-    };
-    let mut headline = vec![
-        Span::styled(" pgtrail ", Style::new().bold().fg(ACCENT)),
-        Span::raw(" │ "),
-        Span::styled("● ", Style::new().fg(color)),
-        Span::styled(status, Style::new().bold()),
-    ];
-    if let Some(id) = app.active_incident {
-        headline.push(Span::styled(
-            format!("  incident #{id}"),
-            Style::new().fg(ACCENT),
-        ));
-    }
-    if app.loading {
-        headline.push(Span::styled("  collecting…", Style::new().fg(MUTED)));
-    }
-    if app.paused() && app.demo && !app.is_offline() {
-        headline.push(Span::styled("  PAUSED", Style::new().fg(WARNING)));
-    }
-    let source = if comparison {
-        " Comparing saved captures offline · live refresh is suspended".into()
-    } else {
-        match app.snapshot() {
-            Some(snapshot) => {
-                let age = (app.now - snapshot.completed_at).num_seconds().max(0);
-                let context_width = usize::from(area.width.saturating_sub(36));
-                let endpoint = fit_text(&clean(&snapshot.source.endpoint), context_width / 2);
-                let database = fit_text(&clean(&snapshot.source.database), context_width / 2);
-                format!(
-                    " Observed {age}s ago · {endpoint} / {database} · PG {}",
-                    clean(&snapshot.source.server_version)
-                )
-            }
-            None => {
-                " Read-only PostgreSQL investigation · local snapshots · no server mutations".into()
-            }
-        }
-    };
-    let mut lines = vec![Line::from(headline), Line::from(source)];
-    if let Some(capture) = &app.capture {
-        lines.push(Line::raw(format!(
-            " Capture #{} · {} · {} UTC",
-            capture.id,
-            clean(&capture.label),
-            capture.captured_at.format("%Y-%m-%d %H:%M:%S")
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
+    shell::render(frame, app);
 }
 
 fn render_activity(frame: &mut Frame, area: Rect, app: &App) {
@@ -254,9 +50,7 @@ fn render_activity(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    let detail_height = if area.height >= 12 { 7 } else { 0 };
-    let [table_area, details] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(detail_height)]).areas(area);
+    let table_area = area;
     let wide = area.width >= 95;
     let rows: Vec<_> = sessions
         .iter()
@@ -272,7 +66,7 @@ fn render_activity(frame: &mut Frame, area: Rect, app: &App) {
             if wide {
                 cells.push(clean(&session.application));
             }
-            Row::new(cells).style(if session.blockers.is_empty() {
+            data_row(cells, &[0, 3, 4]).style(if session.blockers.is_empty() {
                 Style::new()
             } else {
                 Style::new().fg(WARNING)
@@ -293,22 +87,15 @@ fn render_activity(frame: &mut Frame, area: Rect, app: &App) {
         widths.push(Constraint::Percentage(22));
     }
     let table = Table::new(rows, widths)
-        .header(table_header(headers))
-        .block(panel(format!(
-            " Activity · {} visible · current elapsed time ",
-            sessions.len()
-        )));
-    render_table(frame, table_area, table, app.selected());
-    if detail_height > 0
-        && let Some(session) = sessions.get(app.selected())
-    {
-        render_session_details(
-            frame,
-            details,
-            session,
-            " Selected session · Enter: full details ",
-        );
-    }
+        .header(table_header(headers, &[0, 3, 4]))
+        .block(content_panel(
+            app,
+            format!(
+                " Activity · {} visible · current elapsed time ",
+                sessions.len()
+            ),
+        ));
+    render_table(frame, table_area, table, app);
 }
 
 fn render_blocking(frame: &mut Frame, area: Rect, app: &App) {
@@ -331,25 +118,26 @@ fn render_blocking(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let all_sessions = app.snapshot().and_then(|s| s.activity.available());
-    let detail_height = if area.height >= 12 { 7 } else { 0 };
-    let [table_area, details] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(detail_height)]).areas(area);
+    let table_area = area;
     let rows: Vec<_> = edges
         .iter()
         .map(|(waiter, blocker_pid)| {
             let blocker = all_sessions.and_then(|sessions| unique_session(sessions, *blocker_pid));
-            Row::new(vec![
-                waiter.pid.to_string(),
-                format!("→ {blocker_pid}"),
-                duration(waiter.transaction_age_ms),
-                wait(waiter),
-                blocker
-                    .map(|s| value(s.state.as_deref()))
-                    .unwrap_or_else(|| unresolved_blocker(*blocker_pid).into()),
-                blocker
-                    .map(|s| duration(s.transaction_age_ms))
-                    .unwrap_or_else(|| "—".into()),
-            ])
+            data_row(
+                vec![
+                    waiter.pid.to_string(),
+                    format!("→ {blocker_pid}"),
+                    duration(waiter.transaction_age_ms),
+                    wait(waiter),
+                    blocker
+                        .map(|s| value(s.state.as_deref()))
+                        .unwrap_or_else(|| unresolved_blocker(*blocker_pid).into()),
+                    blocker
+                        .map(|s| duration(s.transaction_age_ms))
+                        .unwrap_or_else(|| "—".into()),
+                ],
+                &[0, 1, 2, 5],
+            )
         })
         .collect();
     let table = Table::new(
@@ -363,44 +151,22 @@ fn render_blocking(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(12),
         ],
     )
-    .header(table_header(vec![
-        "Waiter",
-        "Blocker",
-        "Waiter tx",
-        "Wait event",
-        "Blocker state",
-        "Blocker tx",
-    ]))
-    .block(panel(format!(
-        " Blocking · {} server-reported relationships ",
-        edges.len()
-    )));
-    render_table(frame, table_area, table, app.selected());
-    if detail_height > 0
-        && let Some((waiter, blocker_pid)) = edges.get(app.selected())
-    {
-        if let Some(blocker) =
-            all_sessions.and_then(|sessions| unique_session(sessions, *blocker_pid))
-        {
-            render_session_details(
-                frame,
-                details,
-                blocker,
-                &format!(" Blocker {blocker_pid} · waiting session {} ", waiter.pid),
-            );
-        } else {
-            render_empty(
-                frame,
-                details,
-                " Unresolved blocker ",
-                &format!(
-                    "Waiter {} is blocked by PID {blocker_pid}.\n{}; no identity or transaction age is inferred.",
-                    waiter.pid,
-                    unresolved_blocker(*blocker_pid)
-                ),
-            );
-        }
-    }
+    .header(table_header(
+        vec![
+            "Waiter",
+            "Blocker",
+            "Waiter tx",
+            "Wait event",
+            "Blocker state",
+            "Blocker tx",
+        ],
+        &[0, 1, 2, 5],
+    ))
+    .block(content_panel(
+        app,
+        format!(" Blocking · {} server-reported relationships ", edges.len()),
+    ));
+    render_table(frame, table_area, table, app);
 }
 
 fn render_statements(frame: &mut Frame, area: Rect, app: &App) {
@@ -441,9 +207,7 @@ fn render_statements(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    let detail_height = if area.height >= 11 { 6 } else { 0 };
-    let [table_area, details] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(detail_height)]).areas(area);
+    let table_area = area;
     let wide = area.width >= 100;
     let rows: Vec<_> = statements
         .iter()
@@ -458,7 +222,7 @@ fn render_statements(frame: &mut Frame, area: Rect, app: &App) {
             if wide {
                 cells.push(statement.rows.to_string());
             }
-            Row::new(cells)
+            data_row(cells, &[0, 1, 2, 3, 4, 5])
         })
         .collect();
     let title = format!(
@@ -470,7 +234,7 @@ fn render_statements(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Min(18),
         Constraint::Length(8),
         Constraint::Length(13),
-        Constraint::Length(11),
+        Constraint::Length(12),
         Constraint::Length(11),
     ];
     let mut headers = vec![
@@ -485,45 +249,58 @@ fn render_statements(frame: &mut Frame, area: Rect, app: &App) {
         headers.push("Rows");
     }
     let table = Table::new(rows, widths)
-        .header(table_header(headers))
-        .block(panel(title));
-    render_table(frame, table_area, table, app.selected());
-    if detail_height > 0
-        && let Some(statement) = statements.get(app.selected())
-    {
-        let total_blocks = statement
-            .shared_blks_hit
-            .saturating_add(statement.shared_blks_read);
-        let hit_ratio = if total_blocks > 0 {
-            format!(
-                "{:.1}%",
-                statement.shared_blks_hit as f64 * 100.0 / total_blocks as f64
-            )
-        } else {
-            "unavailable (no block accesses)".into()
-        };
-        let lines = vec![
-            Line::raw(format!("User ID {} · database ID {} · top-level {} · shared-buffer hit {}", statement.userid, statement.dbid, statement.toplevel, hit_ratio)),
-            Line::raw(format!("Shared blocks: {} hits / {} reads. These are cumulative counters.", statement.shared_blks_hit, statement.shared_blks_read)).fg(MUTED),
-            Line::raw("Current query age belongs to Activity; this ranking aggregates completed executions.").fg(MUTED),
-            Line::raw(format!("SQL: {}", statement.query.as_deref().map(clean).unwrap_or_else(|| "not captured (opt in with --include-query-text)".into()))),
-        ];
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(panel(" Statement preview · Enter: full details "))
-                .wrap(Wrap { trim: true }),
-            details,
-        );
-    }
+        .header(table_header(headers, &[0, 1, 2, 3, 4, 5]))
+        .block(content_panel(app, title));
+    render_table(frame, table_area, table, app);
 }
 
 fn render_history(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(error) = &app.history_error {
+        render_empty(
+            frame,
+            area,
+            " Captures unavailable ",
+            &format!(
+                "{}\n\nPress r to reload the local capture list.",
+                clean(error)
+            ),
+        );
+        return;
+    }
+    let [summary, area] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
+    let capture_name = |id: Option<i64>| {
+        id.map_or_else(
+            || "not selected".into(),
+            |id| {
+                app.history.iter().find(|c| c.id == id).map_or_else(
+                    || format!("#{id}"),
+                    |c| format!("#{id} {}", clean(&c.label)),
+                )
+            },
+        )
+    };
+    let half = usize::from(summary.width.saturating_sub(24)) / 2;
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(format!(
+                " Before: {}  →  After: {}",
+                fit_text(&capture_name(app.compare_a), half),
+                fit_text(&capture_name(app.compare_b), half)
+            ))
+            .fg(ACCENT),
+            Line::raw(
+                " Mark two observations, then Compare (d). Source and counter resets are checked.",
+            )
+            .fg(MUTED),
+        ]),
+        summary,
+    );
     let captures = app.filtered_history();
     if captures.is_empty() {
         render_empty(
             frame,
             area,
-            " Local history ",
+            " Captures ",
             if app.filter.is_empty() {
                 "No saved captures.\n\nPress c after an observation to save it locally in SQLite.\nCaptures remain available after restart and while disconnected.\n\nMark an earlier capture with a, a later capture with b, then d to compare."
             } else {
@@ -544,30 +321,24 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
                 (false, true) => "B",
                 _ => "",
             };
-            Row::new(vec![
-                mark.into(),
-                capture.id.to_string(),
-                capture.captured_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                clean(&capture.label),
-                if capture.complete {
-                    "complete".into()
-                } else {
-                    "INCOMPLETE".into()
-                },
-                clean(&capture.source),
-            ])
+            data_row(
+                vec![
+                    mark.into(),
+                    capture.id.to_string(),
+                    capture.captured_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    clean(&capture.label),
+                    if capture.complete {
+                        "complete".into()
+                    } else {
+                        "INCOMPLETE".into()
+                    },
+                    clean(&capture.source),
+                ],
+                &[1],
+            )
         })
         .collect();
-    let title = format!(
-        " Local history · {} captures · A: {} → B: {} ",
-        captures.len(),
-        app.compare_a
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "—".into()),
-        app.compare_b
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "—".into())
-    );
+    let title = " Saved captures ";
     let table = Table::new(
         rows,
         [
@@ -579,16 +350,12 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Min(10),
         ],
     )
-    .header(table_header(vec![
-        "",
-        "ID",
-        "Captured UTC",
-        "Label",
-        "Quality",
-        "Source",
-    ]))
-    .block(panel(title));
-    render_table(frame, area, table, app.selected());
+    .header(table_header(
+        vec!["", "ID", "Captured UTC", "Label", "Quality", "Source"],
+        &[1],
+    ))
+    .block(content_panel(app, title));
+    render_table(frame, area, table, app);
 }
 
 fn render_report(frame: &mut Frame, area: Rect, app: &App, report: &str) {
@@ -609,7 +376,20 @@ fn render_report(frame: &mut Frame, area: Rect, app: &App, report: &str) {
         .take(visible)
         .map(report_line)
         .collect();
-    frame.render_widget(Paragraph::new(lines).block(panel(title)), area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            panel(title)
+                .title_bottom(" Esc: close · [ / ]: sections ")
+                .border_style(
+                    Style::new().fg(if app.focus == crate::app::Focus::Inspector {
+                        ACCENT
+                    } else {
+                        BORDER
+                    }),
+                ),
+        ),
+        area,
+    );
 }
 
 fn report_line(line: String) -> Line<'static> {
@@ -623,6 +403,11 @@ fn report_line(line: String) -> Line<'static> {
     } else {
         Style::new()
     };
+    let line = if line.starts_with("# ") || line.starts_with("## ") || line.starts_with("### ") {
+        line.trim_start_matches('#').trim_start().to_owned()
+    } else {
+        line
+    };
     Line::styled(line, style)
 }
 
@@ -631,13 +416,27 @@ fn report_line(line: String) -> Line<'static> {
 pub(crate) fn report_lines(report: &str, width: u16) -> Vec<String> {
     let width = usize::from(width.max(2));
     let mut rows = Vec::new();
+    if report.is_empty() {
+        return vec![String::new()];
+    }
     for line in report.lines() {
         let mut row = String::new();
         for character in clean(line).chars() {
             row.push(character);
             if Span::raw(row.as_str()).width() > width {
                 row.pop();
-                rows.push(std::mem::take(&mut row));
+                // Prefer word boundaries without losing characters from captured SQL.
+                let boundary = row
+                    .char_indices()
+                    .filter(|(_, c)| c.is_whitespace())
+                    .map(|(i, c)| i + c.len_utf8())
+                    .next_back();
+                if let Some(boundary) = boundary {
+                    let tail = row.split_off(boundary);
+                    rows.push(std::mem::replace(&mut row, tail));
+                } else {
+                    rows.push(std::mem::take(&mut row));
+                }
                 row.push(character);
             }
         }
@@ -647,6 +446,9 @@ pub(crate) fn report_lines(report: &str, width: u16) -> Vec<String> {
 }
 
 fn fit_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     if Span::raw(text).width() <= width {
         return text.into();
     }
@@ -662,56 +464,47 @@ fn fit_text(text: &str, width: usize) -> String {
     shortened
 }
 
-fn render_session_details(frame: &mut Frame, area: Rect, session: &Session, title: &str) {
-    let blockers = if session.blockers.is_empty() {
-        "none observed".into()
-    } else {
-        session
-            .blockers
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let lines = vec![
-        Line::raw(format!(
-            "PID {} · user {} · database {} · client {}",
-            session.pid,
-            value(session.user.as_deref()),
-            value(session.database.as_deref()),
-            value(session.client.as_deref())
-        )),
-        Line::raw(format!(
-            "Application: {} · backend started: {}",
-            clean(&session.application),
-            session
-                .backend_start
-                .map(|time| format!("{} UTC", time.format("%Y-%m-%d %H:%M:%S")))
-                .unwrap_or_else(|| "unavailable".into())
-        )),
-        Line::raw(format!(
-            "State: {} · current query: {} · transaction: {} · wait: {}",
-            value(session.state.as_deref()),
-            duration(session.query_age_ms),
-            duration(session.transaction_age_ms),
-            wait(session)
-        )),
-        Line::raw(format!("Blocking PIDs: {blockers}")),
-        Line::raw(format!(
-            "SQL: {}",
-            session
-                .query
-                .as_deref()
-                .map(clean)
-                .unwrap_or_else(|| "not captured (opt in with --include-query-text)".into())
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel(title.to_owned()))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+fn wrap_styled_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| (clean(&span.content), span.style))
+        .collect::<Vec<_>>();
+    let text = spans
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<String>();
+    let mut span_index = 0;
+    let mut span_byte = 0;
+    report_lines(&text, width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut remaining = row.len();
+            let mut output = Vec::new();
+            while remaining > 0 && span_index < spans.len() {
+                let (text, style) = &spans[span_index];
+                let count = remaining.min(text.len() - span_byte);
+                if count > 0 {
+                    output.push(Span::styled(
+                        text[span_byte..span_byte + count].to_owned(),
+                        *style,
+                    ));
+                }
+                span_byte += count;
+                remaining -= count;
+                if span_byte == text.len() {
+                    span_index += 1;
+                    span_byte = 0;
+                }
+            }
+            Line::from(output).style(if index == 0 {
+                line.style
+            } else {
+                line.style.remove_modifier(ratatui::style::Modifier::BOLD)
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn help_dimensions(width: u16, height: u16) -> (u16, u16) {
@@ -724,7 +517,9 @@ pub(crate) fn help_dimensions(width: u16, height: u16) -> (u16, u16) {
 pub(crate) fn help_lines(width: u16) -> Vec<String> {
     report_lines(
         "# NAVIGATION
-Tab / Shift+Tab / 1–9,0   Switch among ten investigation views
+Tab / Shift+Tab          Move between visible zones
+F2 / Ctrl+K              Open navigation / search commands
+1–9,0                    Switch among ten investigation views
 ↑/↓ or j/k · PgUp/PgDn    Select rows / scroll; Home/End: first/last
 /                        Filter this view; Enter: apply, Esc: cancel
 Esc                      Clear filter / close report / return live
@@ -741,13 +536,13 @@ h                        Read provenance, collection coverage and interval readi
 7 Relations: v / s        Tables ↔ indexes / change ranking
 6 Database · 8 Replica · 9 I/O: j/k scroll detailed metrics
 
-# HISTORY AND INCIDENTS
-5 History: Enter         Inspect selected capture offline
+# CAPTURES AND INCIDENTS
+5 Captures: Enter         Inspect selected capture offline
 a / b / d / l            Mark earlier / later / compare / edit label
 i                        Create and activate a local incident
 0 Incidents: Enter       Open the full chronology; activate if open
 n                        Add a note to the active incident
-I in History             Attach selected capture to active incident
+I in Captures             Attach selected capture to active incident
 o / x in Incidents       Close or reopen / stop attaching new captures
 t / Esc in timeline      Return to incident list; t reopens the timeline
 Enter in timeline        Open a capture or the full selected note
@@ -761,63 +556,76 @@ q / Ctrl+C               Quit and restore the terminal",
     )
 }
 
-fn render_help(frame: &mut Frame, area: Rect, scroll: usize) {
-    let (width, height) = help_dimensions(area.width, area.height);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    let rows = help_lines(width.saturating_sub(2));
-    let visible = usize::from(height.saturating_sub(2));
-    let offset = scroll.min(rows.len().saturating_sub(visible));
-    let title = format!(
-        " Keyboard help · {}/{} · ↑/↓ PgUp/PgDn Home/End ",
-        offset + 1,
-        rows.len()
-    );
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(
-            rows.into_iter()
-                .skip(offset)
-                .take(visible)
-                .map(report_line)
-                .collect::<Vec<_>>(),
-        )
-        .block(
-            Block::bordered()
-                .title(title)
-                .border_style(Style::new().fg(ACCENT)),
-        ),
-        popup,
-    );
-}
-
-fn render_table(frame: &mut Frame, area: Rect, table: Table<'_>, selected: usize) {
-    // Ephemeral widget state keeps rendering pure while ensuring the selected row
-    // remains visible after moving past the bottom of a short viewport.
-    let visible_rows = usize::from(area.height.saturating_sub(3)).max(1);
+fn render_table(frame: &mut Frame, area: Rect, table: Table<'_>, app: &App) {
+    let (offset, visible) = layout::table_window(app, area);
     let mut state = TableState::new()
-        .with_selected(Some(selected))
-        .with_offset(selected.saturating_sub(visible_rows - 1));
+        .with_selected(Some(app.row_selection()))
+        .with_offset(offset);
+    let count = app.row_count();
+    let position = format!(
+        " {}–{} / {} · {} ",
+        if count == 0 { 0 } else { offset + 1 },
+        (offset + visible).min(count),
+        count,
+        if app.focus == crate::app::Focus::Content {
+            "Content"
+        } else {
+            "Tab: focus"
+        }
+    );
     frame.render_stateful_widget(
         table
-            .row_highlight_style(Style::new().reversed().bold())
+            .row_highlight_style(Style::new().fg(Color::White).bg(SELECTED).bold())
             .highlight_symbol("› "),
         area,
         &mut state,
     );
+    if area.height > 1 && area.width > 4 {
+        frame.render_widget(
+            Paragraph::new(fit_text(&position, area.width.saturating_sub(4) as usize))
+                .fg(if app.focus == crate::app::Focus::Content {
+                    ACCENT
+                } else {
+                    MUTED
+                })
+                .bg(SURFACE),
+            Rect::new(
+                area.x + 2,
+                area.bottom() - 1,
+                (Span::raw(&position).width() as u16).min(area.width - 4),
+                1,
+            ),
+        );
+    }
 }
 
-fn table_header(labels: Vec<&str>) -> Row<'_> {
-    Row::new(labels).style(Style::new().fg(ACCENT).bold())
+fn table_header(labels: Vec<&str>, numeric: &[usize]) -> Row<'static> {
+    data_row(labels.into_iter().map(str::to_owned).collect(), numeric)
+        .style(Style::new().fg(ACCENT).bold())
 }
 fn panel<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
     Block::bordered()
-        .title(title)
-        .border_style(Style::new().fg(MUTED))
+        .title(title.into().fg(MUTED))
+        .border_style(Style::new().fg(BORDER))
+        .bg(SURFACE)
+}
+
+fn content_panel<'a>(app: &App, title: impl Into<Line<'a>>) -> Block<'a> {
+    panel(title).border_style(Style::new().fg(if app.focus == crate::app::Focus::Content {
+        ACCENT
+    } else {
+        BORDER
+    }))
+}
+
+fn data_row(values: Vec<String>, numeric: &[usize]) -> Row<'static> {
+    Row::new(values.into_iter().enumerate().map(|(index, value)| {
+        ratatui::widgets::Cell::from(Line::raw(value).alignment(if numeric.contains(&index) {
+            ratatui::layout::Alignment::Right
+        } else {
+            ratatui::layout::Alignment::Left
+        }))
+    }))
 }
 
 fn render_empty(frame: &mut Frame, area: Rect, title: &str, message: &str) {
@@ -905,7 +713,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use std::convert::Infallible;
 
-    fn screen(app: &App, width: u16, height: u16) -> Result<String, Infallible> {
+    fn screen(app: &mut App, width: u16, height: u16) -> Result<String, Infallible> {
+        app.viewport_width = width;
+        app.viewport_height = height;
+        app.clamp_scroll();
         let mut terminal = Terminal::new(TestBackend::new(width, height))?;
         terminal.draw(|frame| render(frame, app))?;
         Ok(terminal
@@ -942,14 +753,53 @@ mod tests {
     fn unavailable_and_failed_observations_are_explicit() -> Result<(), Infallible> {
         let mut app = App::new(false);
         app.set_snapshot(snapshot(), false);
-        let text = screen(&app, 120, 30)?;
+        let text = screen(&mut app, 120, 30)?;
         assert!(text.contains("LIVE · CONNECTED"));
-        assert!(text.contains("Extension is not installed"));
         assert!(text.contains("Collection: 1/8 sections; 7 unavailable"));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        assert!(screen(&mut app, 120, 30)?.contains("Extension is not installed"));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
         app.set_error("Database could not be reached".into());
-        let text = screen(&app, 120, 30)?;
+        let text = screen(&mut app, 120, 30)?;
         assert!(text.contains("STALE · COLLECTION FAILED"));
         assert!(text.contains("Database could not be reached"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_read_errors_are_distinct_from_empty_lists_and_can_recover()
+    -> Result<(), Infallible> {
+        use crate::app::CommandId;
+        let mut app = App::new(false);
+        app.tab = Tab::History;
+        app.history_error = Some("Local store could not be opened".into());
+        let text = screen(&mut app, 80, 24)?;
+        assert!(text.contains("Captures unavailable"));
+        assert!(text.contains("Press r to reload"));
+        assert!(!text.contains("No saved captures"));
+        assert!(
+            app.commands()
+                .iter()
+                .find(|c| c.id == CommandId::Inspect)
+                .unwrap()
+                .disabled
+                .is_some()
+        );
+        app.set_history(Vec::new());
+        assert!(screen(&mut app, 80, 24)?.contains("No saved captures"));
+        app.tab = Tab::Incidents;
+        app.incidents_error = Some("Local store could not be opened".into());
+        let text = screen(&mut app, 80, 24)?;
+        assert!(text.contains("Incidents unavailable"));
+        assert!(!text.contains("No incidents yet"));
+        app.set_incidents(Vec::new());
+        assert!(screen(&mut app, 80, 24)?.contains("No incidents yet"));
         Ok(())
     }
 
@@ -957,17 +807,66 @@ mod tests {
     fn demo_offline_and_tiny_terminal_states_render() -> Result<(), Infallible> {
         let mut app = App::new(true);
         app.set_snapshot(snapshot(), false);
-        assert!(screen(&app, 100, 25)?.contains("DEMO · SYNTHETIC DATA"));
+        assert!(screen(&mut app, 100, 25)?.contains("DEMO · SYNTHETIC DATA"));
         app.set_snapshot(snapshot(), true);
-        assert!(screen(&app, 100, 25)?.contains("OFFLINE CAPTURE"));
+        assert!(screen(&mut app, 100, 25)?.contains("OFFLINE CAPTURE"));
         for (width, height) in [(0, 0), (1, 1), (10, 3), (25, 8), (50, 12)] {
             for tab in Tab::ALL {
                 app.tab = tab;
-                screen(&app, width, height)?;
+                screen(&mut app, width, height)?;
             }
             app.help = true;
-            screen(&app, width, height)?;
+            screen(&mut app, width, height)?;
             app.help = false;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responsive_focus_panels_and_overlays_use_the_displayed_geometry() -> Result<(), Infallible> {
+        use crate::app::{CommandId, Focus, Overlay};
+        for theme in [Theme::Dark, Theme::Terminal] {
+            for (width, height) in [
+                (24, 8),
+                (40, 12),
+                (80, 24),
+                (99, 24),
+                (100, 24),
+                (120, 36),
+                (139, 36),
+                (140, 36),
+                (160, 48),
+            ] {
+                let mut app = App::new(true);
+                app.theme = theme;
+                app.set_snapshot(crate::demo::snapshot(0, true), false);
+                screen(&mut app, width, height)?;
+                let geometry = layout::Screen::for_app(&app);
+                assert_eq!(geometry.sidebar.width, if width >= 100 { 22 } else { 0 });
+                assert_eq!(geometry.content.width, width - geometry.sidebar.width);
+                app.execute(CommandId::Inspect);
+                screen(&mut app, width, height)?;
+                let geometry = layout::Screen::for_app(&app);
+                assert_eq!(geometry.split, width >= 140);
+                assert_eq!(app.focus, Focus::Inspector);
+                assert_eq!(
+                    geometry.inspector.width + geometry.content.width + geometry.sidebar.width,
+                    width
+                );
+                app.execute(CommandId::Commands);
+                screen(&mut app, width, height)?;
+                app.overlay = Overlay::None;
+                app.help = true;
+                screen(&mut app, width, height)?;
+                app.help = false;
+                app.execute(CommandId::NewIncident);
+                app.prompt.as_mut().unwrap().value = format!("{}LAST_TYPED", "中文é ".repeat(80));
+                let text = screen(&mut app, width, height)?;
+                assert!(
+                    text.contains("LAST_TYPED"),
+                    "input end hidden at {width}x{height}"
+                );
+            }
         }
         Ok(())
     }
@@ -994,7 +893,7 @@ mod tests {
             KeyCode::End,
             KeyModifiers::NONE,
         )));
-        let text = screen(&app, 120, 16)?;
+        let text = screen(&mut app, 120, 16)?;
         assert!(text.contains("capture-40"));
         assert!(!text.contains("capture-01"));
         assert!(text.contains("›"));
@@ -1028,19 +927,16 @@ mod tests {
             (Tab::Incidents, "Press i to create"),
         ] {
             app.tab = tab;
-            let text = screen(&app, 160, 60)?;
+            let text = screen(&mut app, 160, 60)?;
             assert!(text.contains(expected), "{tab:?} should contain {expected}");
-            assert!(
-                text.contains("0 Incidents"),
-                "Second row of view navigation is present"
-            );
+            assert!(text.contains("0 Incidents"), "Grouped sidebar is present");
         }
         app.tab = Tab::Relations;
         app.show_indexes = true;
-        assert!(screen(&app, 160, 40)?.contains("Validity"));
+        assert!(screen(&mut app, 160, 40)?.contains("Validity"));
         app.tab = Tab::Statements;
         app.statement_interval = true;
-        let text = screen(&app, 160, 40)?;
+        let text = screen(&mut app, 160, 40)?;
         assert!(text.contains("Calls/s"));
         assert!(text.contains("Temp blocks/s"));
         Ok(())
@@ -1052,7 +948,7 @@ mod tests {
         app.set_snapshot(crate::demo::snapshot(0, false), false);
         app.set_snapshot(crate::demo::snapshot(1, false), true);
         app.tab = Tab::Database;
-        let text = screen(&app, 160, 60)?;
+        let text = screen(&mut app, 160, 60)?;
         assert!(text.contains("Live trends are hidden"));
         assert!(!text.contains("visible samples"));
         Ok(())
@@ -1066,8 +962,8 @@ mod tests {
             KeyCode::Enter,
             KeyModifiers::NONE,
         )));
-        let text = screen(&app, 120, 40)?;
-        assert!(text.contains("FINDING DETAILS"));
+        let text = screen(&mut app, 120, 40)?;
+        assert!(text.contains("FROZEN EVIDENCE"));
         assert!(text.contains("Finding details"));
         assert!(!text.contains("OFFLINE COMPARISON"));
         app.update(Message::Key(KeyEvent::new(
@@ -1082,10 +978,10 @@ mod tests {
             KeyCode::Char('q'),
             KeyModifiers::NONE,
         )));
-        let text = screen(&app, 120, 40)?;
+        let text = screen(&mut app, 120, 40)?;
         assert!(text.contains("New incident"));
         assert!(text.contains("q▏"));
-        assert!(text.contains("Enter: save"));
+        assert!(text.contains("Enter Save"));
         assert!(!app.should_quit());
         Ok(())
     }
@@ -1102,7 +998,7 @@ mod tests {
         second.completed_at = second.started_at;
         app.set_snapshot(first, false);
         app.set_snapshot(second, false);
-        for (width, height) in [(80, 24), (140, 36)] {
+        for (width, height) in [(80, 24), (120, 36), (160, 48)] {
             for (tab, expected) in [
                 (Tab::Overview, "Severity"),
                 (Tab::Activity, "Query age"),
@@ -1116,20 +1012,23 @@ mod tests {
                 (Tab::Incidents, "No incidents"),
             ] {
                 app.tab = tab;
-                let text = screen(&app, width, height)?;
+                let text = screen(&mut app, width, height)?;
                 assert!(
                     text.contains(expected),
                     "{width}x{height} {tab:?}: missing {expected}"
                 );
-                assert!(text.contains("0 Incidents"));
+                assert!(text.contains("F2 Menu"));
+                if width >= 100 {
+                    assert!(text.contains("0 Incidents"));
+                }
             }
             app.tab = Tab::Statements;
             app.statement_interval = true;
-            assert!(screen(&app, width, height)?.contains("Temp blocks/s"));
+            assert!(screen(&mut app, width, height)?.contains("Temp blocks/s"));
             app.statement_interval = false;
             app.tab = Tab::Relations;
             app.show_indexes = true;
-            assert!(screen(&app, width, height)?.contains("Constraint"));
+            assert!(screen(&mut app, width, height)?.contains("Constraint"));
             app.show_indexes = false;
         }
         Ok(())
@@ -1153,12 +1052,13 @@ mod tests {
         });
         app.tab = Tab::Activity;
         for (width, height) in [(80, 24), (120, 36)] {
-            let text = screen(&app, width, height)?;
+            let text = screen(&mut app, width, height)?;
             assert!(text.contains("Observed 42s ago"));
             assert!(text.contains("checkout"));
-            assert!(text.contains("some-extraord"));
+            assert!(text.contains("some-extra"));
+            assert!(text.contains("SYNTHETIC DATA"));
             assert!(text.contains("Capture #123 · Before pool adjustment"));
-            assert!(text.contains("Enter: full details"));
+            assert!(text.contains("Enter Inspect"));
         }
         Ok(())
     }
@@ -1191,7 +1091,7 @@ mod tests {
                 app.report = Some(report);
                 app.report_title = title;
                 app.report_scroll = usize::MAX;
-                let text = screen(&app, width, height)?;
+                let text = screen(&mut app, width, height)?;
                 assert!(
                     text.contains("END_OF_CAPTURED_SQL"),
                     "{width}x{height} {tab:?}"
@@ -1207,14 +1107,14 @@ mod tests {
     fn scrollable_help_exposes_final_actions_and_navigation() -> Result<(), Infallible> {
         let mut app = App::new(true);
         app.help = true;
+        app.help_all = true;
         for (width, height) in [(80, 24), (120, 36)] {
             app.help_scroll = 0;
-            let first = screen(&app, width, height)?;
+            let first = screen(&mut app, width, height)?;
             assert!(first.contains("NAVIGATION"));
-            assert!(first.contains("PgUp/PgDn Home/End"));
+            assert!(first.contains("Move between visible zones"));
             app.help_scroll = usize::MAX;
-            let last = screen(&app, width, height)?;
-            assert!(last.contains("HISTORY AND INCIDENTS"));
+            let last = screen(&mut app, width, height)?;
             assert!(last.contains("Quit and restore the terminal"));
             assert!(last.contains("SQL text requires opt-in"));
         }
@@ -1233,6 +1133,32 @@ mod tests {
             );
         }
         assert_eq!(report_lines("a\u{1b}[31m\nb", 78), ["a [31m", "b"]);
+    }
+
+    #[test]
+    fn comparison_header_identifies_saved_sources_instead_of_the_live_observation()
+    -> Result<(), Infallible> {
+        let mut app = App::new(false);
+        app.set_snapshot(snapshot(), false);
+        app.set_report("# Comparison\nSaved evidence".into());
+        let capture = |id| SnapshotSummary {
+            id,
+            label: format!("Capture {id}"),
+            captured_at: app.now,
+            source: "demo / saved_shop".into(),
+            complete: true,
+        };
+        app.comparison = Some(crate::app::ComparisonContext {
+            before: capture(11),
+            after: capture(12),
+            synthetic: true,
+        });
+        let text = screen(&mut app, 80, 24)?;
+        assert!(text.contains("Before #11 → After #12 · demo / saved_shop"));
+        assert!(text.contains("SYNTHETIC DATA"));
+        assert!(!text.contains("localhost:5432"));
+        assert!(!text.contains("Observed 0s ago"));
+        Ok(())
     }
 
     #[test]
@@ -1289,7 +1215,7 @@ mod tests {
         app.set_snapshot(crate::demo::snapshot(0, false), false);
         for tab in [Tab::Database, Tab::Replication, Tab::Io] {
             app.tab = tab;
-            let text = screen(&app, 80, 24)?;
+            let text = screen(&mut app, 80, 24)?;
             assert!(!text.contains("/: filter"));
         }
         app.tab = Tab::Activity;
@@ -1297,9 +1223,19 @@ mod tests {
         terminal.draw(|frame| render(frame, &app))?;
         let buffer = terminal.backend().buffer();
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "›"));
-        // Theme-configured foreground keeps freshness readable without assuming
-        // a light or dark terminal background.
-        assert_eq!(buffer[(1, 1)].fg, Color::Reset);
+        assert_eq!(buffer[(1, 1)].fg, Color::Rgb(148, 163, 184));
+        app.theme = Theme::Terminal;
+        terminal.draw(|frame| render(frame, &app))?;
+        assert_eq!(terminal.backend().buffer()[(1, 1)].fg, Color::Reset);
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .filter(|cell| cell.bg == Color::Blue)
+                .all(|cell| cell.fg == Color::White)
+        );
         Ok(())
     }
 }

@@ -58,6 +58,7 @@ fn selected_id(app: &App) -> TimelineId {
 #[test]
 fn full_chronology_navigation_and_refresh_keep_selected_event() {
     let mut app = app();
+    app.viewport_height = 19; // Ten chronology rows between the shell and table headings.
     assert_eq!(timeline(app.incident.as_ref().unwrap()).len(), 15);
     key(&mut app, KeyCode::End);
     assert_eq!(app.incident_cursor, 14);
