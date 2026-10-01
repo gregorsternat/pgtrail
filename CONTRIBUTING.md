@@ -1,5 +1,7 @@
 # Contributing
 
+<!-- owner: maintainers; reviewed: 2026-09-28 -->
+
 ## Setup
 
 Follow the README quick start. Rustup reads `rust-toolchain.toml`; add
@@ -18,7 +20,10 @@ Use standard rustfmt, narrow visibility, enums for meaningful states, and concre
 types before introducing generic interfaces. Document non-obvious invariants and
 public behavior. Return contextual errors for invalid input or I/O problems rather
 than using `unwrap` or `expect` in production paths. Add typed errors when recovery
-depends on an error category. Project code forbids `unsafe`.
+depends on an error category. Project code forbids `unsafe`. Use `anyhow` at application boundaries and typed
+errors where recovery depends on a category. Avoid broad lint suppressions; explain
+narrow exceptions inline. Create modules only for implemented responsibilities and
+keep public APIs private until a concrete caller requires them.
 
 The minimum supported Rust version is the pinned compiler version, including its
 patch release. When updating it, update both Cargo metadata and the toolchain file,
@@ -27,9 +32,23 @@ builds use `--locked`. Do not edit the lockfile by hand.
 
 ## Validation
 
-Run `just check` or the four equivalent Cargo commands in the README. The same
-commands run on Linux and macOS in CI. No database is required for these checks.
-Test behavior and useful failure modes; no coverage percentage is required.
+Run `just check`. It runs the following commands, also available without `just`:
+
+```sh
+python3 -B scripts/test-check-docs.py
+python3 -B scripts/check-docs.py
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked
+python3 scripts/check-terminal.py
+```
+
+The same checks run in CI; Rust and PTY checks run on Linux and macOS. Python 3
+uses only its standard library. No database is required. `just docs-check` runs
+only the documentation checks; `just architecture-check` runs the source boundary
+checks and their negative regression fixtures. Test behavior and useful failure
+modes; no coverage percentage is required.
 
 For terminal changes, also verify in an actual interactive terminal:
 
@@ -98,11 +117,35 @@ from observed NULLs and zero. Metric tests should cover resets, absent or reused
 identities, truncation, timing settings, and zero denominators. Tests must not
 depend on production credentials or a running server unless explicitly gated.
 
+## Isolated local feedback
+
+Use a temporary directory and explicit paths for ad hoc demo/CLI runs so worktrees
+do not share personal history or profiles:
+
+```sh
+pgtrail_scratch=$(mktemp -d)
+cargo run --locked -- --demo --store "$pgtrail_scratch/history.sqlite3" \
+  --profiles-file "$pgtrail_scratch/profiles.json"
+```
+
+The PTY and CLI tests already use temporary storage, and the PTY stalled-connection
+check binds a local ephemeral port. For live work use a unique Compose project and
+port as shown above. Reports in JSON or Markdown, UI coverage/freshness, and failing
+test output provide the first debugging evidence. Add targeted timing or tracing
+only when needed, without exposing connection configuration or operational SQL.
+
 ## Documentation and review
 
 Keep each fact in one place: README for usage/status, architecture for boundaries
 and decisions, roadmap for future acceptance criteria, and AGENTS.md for concise
 agent instructions. Update relevant documentation with the behavior it describes.
+The [knowledge index](docs/index.md) maps owners and review triggers; the
+[quality map](docs/quality.md) records coverage gaps. Use a versioned
+[execution plan](docs/plans.md) for complex work and preserve the completed plan's
+validation evidence. Record unresolved compromises in the
+[debt tracker](docs/exec-plans/tech-debt-tracker.md). Documentation checks enforce
+local links, heading fragments, discoverability, metadata, and a 90-day review
+window. Review facts against code before renewing a date.
 Do not commit transcripts, sensitive captures, or copied dependency documentation.
 
 Use English scoped Conventional Commits, for example
@@ -110,6 +153,8 @@ Use English scoped Conventional Commits, for example
 PR descriptions explain the concrete problem, resulting behavior, and checks run.
 Report unavailable checks honestly; a local success is not a verified CI run.
 
-CI runs on pull requests and pushes to `main`. Dependency update PRs are generated
+CI runs on pull requests, pushes to `main`, and manual dispatch. A weekly scheduled
+run checks repository documentation for drift; inspect failures and submit focused
+fixes through the normal review process. Dependency update PRs are generated
 weekly for Cargo and GitHub Actions. Actions are pinned by commit. CI
 does not publish to crates.io or create release binaries automatically.

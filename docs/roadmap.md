@@ -1,5 +1,7 @@
 # Roadmap
 
+<!-- owner: maintainers; reviewed: 2026-09-28 -->
+
 Version 1.1 extends the original five v1 slices into a daily investigation workflow
 for one PostgreSQL 16–18 target, with read-only collection and local evidence.
 The README documents shipped behavior and commands; this file records scope and
