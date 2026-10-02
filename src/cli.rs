@@ -2,6 +2,13 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ThemeChoice {
+    #[default]
+    Dark,
+    Terminal,
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -9,6 +16,12 @@ use clap::{Parser, Subcommand, ValueEnum};
     long_about = "Read-only PostgreSQL investigation, local snapshots, and offline comparisons.\n\nRun with --demo to explore without a database. Set PGTRAIL_DATABASE_URL for a live connection. SQL text is excluded unless explicitly enabled."
 )]
 pub(crate) struct Cli {
+    /// Color palette for the interactive terminal
+    #[arg(long, value_enum, default_value_t = ThemeChoice::Dark, global = true)]
+    pub(crate) theme: ThemeChoice,
+    /// Leave mouse input to the terminal instead of the TUI
+    #[arg(long, global = true)]
+    pub(crate) no_mouse: bool,
     /// PostgreSQL URL; prefer PGTRAIL_DATABASE_URL to keep credentials out of shell history
     #[arg(long, global = true, conflicts_with = "demo")]
     pub(crate) database_url: Option<String>,

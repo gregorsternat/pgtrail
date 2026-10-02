@@ -23,7 +23,7 @@ enum Work {
     History(u64, Result<Vec<SnapshotSummary>>),
     Saved(Result<(i64, Option<i64>)>),
     Loaded(u64, Result<(Snapshot, SnapshotSummary)>),
-    Compared(u64, Result<String>),
+    Compared(u64, Result<(String, app::ComparisonContext)>),
     Incidents(u64, Result<Vec<IncidentSummary>>),
     SelectedIncident(u64, Result<Incident>),
     UpdatedIncident(u64, i64, Result<Incident>),
@@ -137,10 +137,56 @@ async fn load_capture(store: &Store, id: i64) -> Result<(Snapshot, SnapshotSumma
     Ok((snapshot, summary))
 }
 
+fn apply_input(
+    app: &mut app::App,
+    generation: &mut u64,
+    message: event::Message,
+) -> Option<Action> {
+    if matches!(
+        message,
+        event::Message::Key(_)
+            | event::Message::MouseClick { .. }
+            | event::Message::ScrollUp { .. }
+            | event::Message::ScrollDown { .. }
+    ) {
+        *generation = generation.wrapping_add(1);
+    }
+    app.update(message)
+}
+
+fn complete_capture_load(
+    app: &mut app::App,
+    requested: u64,
+    current: u64,
+    result: Result<(Snapshot, SnapshotSummary)>,
+) {
+    if requested != current {
+        app.discard_pending_capture_return(requested);
+        return;
+    }
+    match result {
+        Ok((snapshot, capture)) => {
+            app.pending_capture_request = None;
+            app.set_snapshot(snapshot, true);
+            app.capture = Some(capture);
+        }
+        Err(error) => {
+            app.discard_pending_capture_return(requested);
+            app.set_notice(format!("Could not load capture: {error}"));
+        }
+    }
+}
+
 pub(crate) async fn run(cli: &Cli) -> Result<()> {
     let collector = collector(cli).await?;
     let path = cli.store_path()?;
     let mut app = app::App::new(cli.demo);
+    app.theme = match cli.theme {
+        crate::cli::ThemeChoice::Dark => ui::Theme::Dark,
+        crate::cli::ThemeChoice::Terminal => ui::Theme::Terminal,
+    };
+    app.mouse_enabled = !cli.no_mouse;
+    app.connection_configured = collector.is_some() || cli.demo;
     if let Some(id) = cli.incident {
         let incident = Store::open(&path).await?.incident(id).await?;
         anyhow::ensure!(
@@ -149,7 +195,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         );
         app.set_incident(incident);
     }
-    let mut terminal = terminal::Session::start()?;
+    let mut terminal = terminal::Session::start(!cli.no_mouse)?;
     let mut events = EventStream::new();
     if collector.is_none() && !cli.demo {
         app.set_loading(false);
@@ -188,8 +234,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         tokio::select! {
             message = event::next(&mut events) => {
                 let message = message?;
-                if matches!(message, event::Message::Key(_)) { view_generation = view_generation.wrapping_add(1); }
-                if let Some(action) = app.update(message) {
+                if let Some(action) = apply_input(&mut app, &mut view_generation, message) {
                     match action {
                         Action::Refresh => refresh_requested = true,
                         Action::Capture => {
@@ -216,7 +261,9 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                                 let store = Store::open(&path).await?;
                                 let (before, before_capture) = load_capture(&store, before).await?;
                                 let (after, after_capture) = load_capture(&store, after).await?;
-                                Ok(report::comparison_with_captures_markdown(&compare::compare(&before, &after), &before_capture, &after_capture))
+                                let report = report::comparison_with_captures_markdown(&compare::compare(&before, &after), &before_capture, &after_capture);
+                                let context = app::ComparisonContext { before: before_capture, after: after_capture, synthetic: before.is_synthetic() || after.is_synthetic() };
+                                Ok((report, context))
                             }.await) });
                         }
                         Action::ListHistory => refresh_history(&mut work, &path, &mut requests),
@@ -282,11 +329,11 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                     }
                     Some(Ok(Work::History(request, result))) if request == requests.history => match result {
                         Ok(history) => app.set_history(history),
-                        Err(error) => app.set_notice(format!("History unavailable: {error}")),
+                        Err(error) => { let message = format!("Captures unavailable: {error}"); app.history_error = Some(message.clone()); app.set_notice(message); },
                     },
                     Some(Ok(Work::Incidents(request, result))) if request == requests.incidents => match result {
                         Ok(incidents) => app.set_incidents(incidents),
-                        Err(error) => app.set_notice(format!("Incidents unavailable: {error}")),
+                        Err(error) => { let message = format!("Incidents unavailable: {error}"); app.incidents_error = Some(message.clone()); app.set_notice(message); },
                     },
                     Some(Ok(Work::SelectedIncident(generation, result))) if generation == view_generation => match result {
                         Ok(incident) => {
@@ -323,7 +370,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                         saving = false;
                         match result {
                             Ok((id, incident)) => {
-                                app.set_notice(match incident { Some(incident) => format!("Saved capture #{id} in incident #{incident}. Open History with 5."), None => format!("Saved capture #{id}. Open History with 5.") });
+                                app.set_notice(match incident { Some(incident) => format!("Saved capture #{id} in incident #{incident}. Open Captures with 5."), None => format!("Saved capture #{id}. Open Captures with 5.") });
                                 refresh_history(&mut work, &path, &mut requests);
                                 refresh_incidents(&mut work, &path, app.incident.as_ref().map(|v| v.summary.id), &mut requests);
                             }
@@ -338,19 +385,11 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                             Err(error) => format!("Export failed for incident #{id}: {error}"),
                         });
                     }
-                    Some(Ok(Work::Loaded(generation, result))) if generation == view_generation => match result {
-                        Ok((snapshot, capture)) => {
-                            app.pending_capture_request = None;
-                            app.set_snapshot(snapshot, true);
-                            app.capture = Some(capture);
-                        },
-                        Err(error) => { app.discard_pending_capture_return(generation); app.set_notice(format!("Could not load capture: {error}")); },
-                    },
+                    Some(Ok(Work::Loaded(generation, result))) => complete_capture_load(&mut app, generation, view_generation, result),
                     Some(Ok(Work::Compared(generation, result))) if generation == view_generation => match result {
-                        Ok(report) => app.set_report(report),
+                        Ok((report, context)) => { app.set_report(report); app.comparison = Some(context); },
                         Err(error) => app.set_notice(format!("Could not compare captures: {error}")),
                     },
-                    Some(Ok(Work::Loaded(generation, _))) => app.discard_pending_capture_return(generation),
                     Some(Ok(Work::Compared(_, _) | Work::SelectedIncident(_, _) | Work::History(_, _) | Work::Incidents(_, _) | Work::UpdatedIncident(_, _, _))) => {}
                     Some(Err(_)) => {
                         refreshing = false;
@@ -381,7 +420,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                     Work::Collected(collector.collect().await.map_err(anyhow::Error::from))
                 });
             } else {
-                app.set_notice("Set PGTRAIL_DATABASE_URL for live monitoring, or run pgtrail --demo. Saved history works offline.".into());
+                app.set_notice("Set PGTRAIL_DATABASE_URL for live monitoring, or run pgtrail --demo. Saved captures work offline.".into());
             }
         }
     }
@@ -393,6 +432,60 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_capture_load_cannot_override_mouse_or_palette_navigation() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for pointer in [true, false] {
+            let mut app = app::App::new(true);
+            app.viewport_width = 120;
+            app.viewport_height = 36;
+            app.set_snapshot(demo::snapshot(0, false), false);
+            app.tab = app::Tab::History;
+            let requested = 5;
+            let mut generation = requested;
+            if pointer {
+                let area = ui::layout::Screen::for_app(&app).sidebar;
+                let (rect, _, _) = ui::menu_items(&app, area)
+                    .into_iter()
+                    .find(|(_, tab, _)| *tab == app::Tab::Activity)
+                    .unwrap();
+                apply_input(
+                    &mut app,
+                    &mut generation,
+                    event::Message::MouseClick {
+                        column: rect.x,
+                        row: rect.y,
+                    },
+                );
+            } else {
+                app.overlay = app::Overlay::Commands {
+                    query: "go to activity".into(),
+                    selected: 0,
+                };
+                apply_input(
+                    &mut app,
+                    &mut generation,
+                    event::Message::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                );
+            }
+            let current_source = app.snapshot().unwrap().source.clone();
+            let mut delayed = demo::snapshot(1, false);
+            delayed.source.database = "older capture source".into();
+            let summary = SnapshotSummary {
+                id: 1,
+                label: "delayed".into(),
+                captured_at: delayed.completed_at,
+                source: "synthetic".into(),
+                complete: true,
+            };
+            complete_capture_load(&mut app, requested, generation, Ok((delayed, summary)));
+            assert_eq!(app.tab, app::Tab::Activity);
+            assert_eq!(app.snapshot().unwrap().source, current_source);
+            assert!(app.capture.is_none());
+            assert!(!app.is_offline());
+        }
+    }
 
     #[tokio::test]
     async fn offline_capture_load_retains_current_label_and_rejects_missing_payload() -> Result<()>

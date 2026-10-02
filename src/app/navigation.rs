@@ -1,4 +1,4 @@
-use super::{Action, App, Tab};
+use super::{Action, App, Focus, ReportKind, Tab};
 use crate::{
     compare::{SessionIdentity, StatementIdentity},
     model::{Session, Snapshot, Statement},
@@ -41,6 +41,9 @@ impl Identity {
 
 #[derive(Debug)]
 pub(super) struct Location {
+    table_offsets: [usize; 10],
+    focus: Focus,
+    report_kind: ReportKind,
     tab: Tab,
     selected: [usize; 10],
     filters: [String; 10],
@@ -69,30 +72,53 @@ fn statement_identity(statement: &Statement) -> StatementIdentity {
 }
 
 impl App {
-    pub(super) fn max_report_scroll(&self) -> usize {
-        let header = if self.capture.is_some() { 3 } else { 2 };
-        let message = if self.error.is_some() || self.notice.is_some() {
-            2
+    pub(super) fn page_rows(&self) -> isize {
+        let screen = crate::ui::layout::Screen::for_app(self);
+        let rows = if self.focus == Focus::Inspector {
+            screen.inspector.height.saturating_sub(2)
+        } else if matches!(self.tab, Tab::Database | Tab::Replication | Tab::Io) {
+            screen.content.height.saturating_sub(2)
         } else {
-            0
+            screen.table(self).height.saturating_sub(3)
         };
-        let visible = usize::from(
-            self.viewport_height
-                .saturating_sub(header + 2 + message + 1 + 1 + 2),
-        )
-        .max(1);
+        rows.max(1) as isize
+    }
+
+    pub(super) fn max_report_scroll(&self) -> usize {
+        let area = crate::ui::layout::Screen::for_app(self).inspector;
+        let visible = usize::from(area.height.saturating_sub(2)).max(1);
         self.report.as_ref().map_or(0, |report| {
-            crate::ui::report_lines(report, self.viewport_width.saturating_sub(2))
+            crate::ui::report_lines(report, area.width.saturating_sub(2))
                 .len()
                 .saturating_sub(visible)
         })
     }
 
     pub(crate) fn clamp_scroll(&mut self) {
+        let screen = crate::ui::layout::Screen::for_app(self);
+        if self.viewport_width >= 100 && matches!(self.overlay, super::Overlay::Menu) {
+            self.overlay = super::Overlay::None;
+            self.focus = Focus::Sidebar;
+        }
+        if self.report.is_some() && !screen.split && self.focus == Focus::Content {
+            self.focus = Focus::Inspector;
+        }
+        if self.viewport_width < 100 && self.focus == Focus::Sidebar {
+            self.focus = if self.report.is_some() {
+                Focus::Inspector
+            } else {
+                Focus::Content
+            };
+        }
+        if screen.content.width > 0 {
+            self.clamp_selection();
+            self.table_offsets[self.tab.index()] =
+                crate::ui::layout::table_window(self, screen.table(self)).0;
+        }
         self.report_scroll = self.report_scroll.min(self.max_report_scroll());
         let (width, height) = crate::ui::help_dimensions(self.viewport_width, self.viewport_height);
         self.help_scroll = self.help_scroll.min(
-            crate::ui::help_lines(width.saturating_sub(2))
+            crate::ui::help_rows(self, width.saturating_sub(2))
                 .len()
                 .saturating_sub(usize::from(height.saturating_sub(2))),
         );
@@ -100,6 +126,19 @@ impl App {
 
     pub(crate) fn has_return_path(&self) -> bool {
         !self.navigation.is_empty()
+    }
+
+    pub(crate) fn breadcrumb(&self) -> String {
+        if self.navigation.is_empty() {
+            return String::new();
+        }
+        let mut path = self
+            .navigation
+            .iter()
+            .map(|location| location.tab.title())
+            .collect::<Vec<_>>();
+        path.push(self.tab.title());
+        format!("  ·  {}", path.join(" › "))
     }
 
     pub(crate) fn filter_available(&self) -> bool {
@@ -241,6 +280,9 @@ impl App {
 
     pub(super) fn remember_location(&mut self) {
         self.navigation.push(Location {
+            table_offsets: self.table_offsets,
+            focus: self.focus,
+            report_kind: self.report_kind,
             tab: self.tab,
             selected: self.selected,
             filters: self.filters.clone(),
@@ -262,6 +304,9 @@ impl App {
 
     pub(super) fn return_to_origin(&mut self) -> Option<Action> {
         let origin = self.navigation.pop()?;
+        self.table_offsets = origin.table_offsets;
+        self.focus = origin.focus;
+        self.report_kind = origin.report_kind;
         self.tab = origin.tab;
         self.selected = origin.selected;
         self.filters = origin.filters;
@@ -308,6 +353,7 @@ impl App {
         self.remember_location();
         self.filters[self.tab.index()] = self.filter.clone();
         self.tab = tab;
+        self.focus = Focus::Content;
         self.filter.clear();
         self.report = None;
         self.report_scroll = 0;
@@ -461,14 +507,44 @@ impl App {
                 analysis.coverage.join("\n\n")
             ));
             self.report_title = "Coverage and limits";
+            self.report_kind = ReportKind::Coverage;
         }
     }
 
     pub(super) fn report_section(&mut self, next: bool) {
+        if self.report.is_none() {
+            let area = crate::ui::layout::Screen::for_app(self).content;
+            let rows = crate::ui::metric_rows(self, area.width.saturating_sub(2));
+            let headings = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, line)| {
+                    line.style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::BOLD)
+                        .then_some(i)
+                })
+                .collect::<Vec<_>>();
+            self.selected[self.tab.index()] = if next {
+                headings
+                    .into_iter()
+                    .find(|i| *i > self.selected())
+                    .unwrap_or(self.selected())
+            } else {
+                headings
+                    .into_iter()
+                    .rev()
+                    .find(|i| *i < self.selected())
+                    .unwrap_or(0)
+            };
+            self.clamp_selection();
+            return;
+        }
         let Some(report) = &self.report else {
             return;
         };
-        let lines = crate::ui::report_lines(report, self.viewport_width.saturating_sub(2));
+        let area = crate::ui::layout::Screen::for_app(self).inspector;
+        let lines = crate::ui::report_lines(report, area.width.saturating_sub(2));
         let headings: Vec<_> = lines
             .iter()
             .enumerate()

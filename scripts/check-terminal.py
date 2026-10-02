@@ -39,6 +39,8 @@ class TerminalOutput(bytearray):
         self.cells = {}
         self.row = self.column = 1
         self.entered = self.exited = False
+        self.mouse_started = False
+        self.mouse_modes = set()
 
     def extend(self, data):
         super().extend(data)
@@ -59,6 +61,12 @@ class TerminalOutput(bytearray):
                     self.entered = True
                 elif params == "?1049" and command == "l":
                     self.exited = True
+                elif params in ("?1000", "?1002", "?1003", "?1006", "?1015"):
+                    if command == "h":
+                        self.mouse_started = True
+                        self.mouse_modes.add(params)
+                    elif command == "l":
+                        self.mouse_modes.discard(params)
                 elif command in ("H", "f"):
                     self.row = first
                     self.column = (numbers[1] if len(numbers) > 1 else 1) or 1
@@ -138,6 +146,8 @@ def terminal(store, arguments, actions, database_url=None, size=(120, 36)):
         assert process.returncode == 0, bytes(output[-1600:])
         assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
         assert output.entered and output.exited, "Alternate screen was not restored"
+        assert not output.mouse_modes, "Mouse capture was not restored"
+        assert output.mouse_started == ("--no-mouse" not in arguments), "Mouse preference was not respected"
     finally:
         if process.poll() is None:
             process.kill()
@@ -234,6 +244,9 @@ def exercise(store, size):
         with sqlite3.connect(store) as connection:
             note = "Observed a blocked checkout " + "timeline evidence " * 200 + "END_OF_LONG_NOTE"
             connection.execute("UPDATE incident_notes SET text=? WHERE id=(SELECT min(id) FROM incident_notes)", (note,))
+        annotation = "Contexte échec 東京\n" * 100 + "END_OF_CAPTURE_ANNOTATION"
+        subprocess.run([BINARY, "--store", str(store), "annotate", "6", "--note", annotation],
+                       env=environment(), check=True, capture_output=True)
         key(b"0")
         key(b"\r")
         until(lambda: b"chronology" in output.lower(), "Incident chronology missing")
@@ -244,6 +257,12 @@ def exercise(store, size):
         until(lambda: "END_OF_LONG_NOTE" in output.visible(), "End of long incident note is unreachable")
         key(b"\x1b")
         key(b"G")
+        until(lambda: "annotated" in output.visible(), "Capture annotation indicator missing")
+        key(b"a")
+        until(lambda: "Capture details" in output.visible(), "Capture details action missing")
+        key(b"G")
+        until(lambda: "END_OF_CAPTURE_ANNOTATION" in output.visible(), "Full capture annotation is unreachable")
+        key(b"\x1b")
         key(b"\r")
         until(lambda: b"OFFLINE CAPTURE" in output, "Timeline capture did not open")
         key(b"\x1b")
@@ -253,6 +272,7 @@ def exercise(store, size):
         key(b"\r")
         until(markdown.exists, "Markdown export was not written")
         assert "Chronology note 6" in markdown.read_text()
+        assert "END_OF_CAPTURE_ANNOTATION" in markdown.read_text().replace("\\_", "_")
         assert markdown.stat().st_mode & 0o777 == 0o600, "Export is not private"
         key(b"E" + str(json_export).encode())
         key(b"\r")
@@ -373,9 +393,92 @@ def interrupt_recording(store):
             process.wait()
 
 
+def mouse_controls(store, size, no_mouse=False):
+    def actions(process, slave, key, pump, until, output):
+        def click(label):
+            for row, line in enumerate(output.visible().splitlines(), 1):
+                column = line.find(label)
+                if column >= 0:
+                    key(f"\x1b[<0;{column + 1};{row}M".encode())
+                    return
+            raise AssertionError(f"Missing clickable control {label!r}\n{output.visible()}")
+
+        def view(name):
+            until(lambda: name in output.visible().splitlines()[2], f"View did not open: {name}")
+
+        until(lambda: "SYNTHETIC DATA" in output.visible(), "Demo did not load")
+        if no_mouse:
+            key(b"\x1b[<0;2;3M")
+            assert "Navigate" not in output.visible(), "--no-mouse still opened the menu"
+            key(b"\x0bgo to activity\r")
+            view("Activity")
+            key(b"\x03")
+            return
+
+        click("Commands")
+        key(b"go to statements\r")
+        view("Statements")
+        click("Mode: cumulative")
+        assert "Mode: interval" in output.visible()
+        click("Mode: interval")
+        click("Filter")
+        key(b"q")
+        assert process.poll() is None, "Filter input triggered quit"
+        click("Esc Cancel")
+        click("Commands")
+        key(b"create incident\r")
+        until(lambda: "Enter Save" in output.visible(), "Command palette did not open the incident editor")
+        key("Mouse case é".encode())
+        until(lambda: "Mouse case é" in output.visible(), "Incident title was not displayed")
+        click("Enter Save")
+        until(lambda: scalar(store, "SELECT count(*) FROM incidents") == 1, "Mouse save failed")
+        until(lambda: "activated incident #1" in output.visible(), "Mouse-created incident not active")
+
+        # Coordinates come from the freshly rendered output at every width.
+        for width, height in ((99, 24), (100, 24), (139, 30), (140, 30), size):
+            output.width, output.height = width, height
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+            os.kill(process.pid, signal.SIGWINCH)
+            pump()
+            if width < 100:
+                click("F2 Menu")
+            click("2 Activity")
+            view("Activity")
+            key(b"G")
+            # Select a visible PID, then use the action button to inspect it.
+            click("4101")
+            click("Enter Inspect")
+            until(lambda: "Session details" in output.visible(), "Mouse inspection failed after resize")
+            assert "PID: 4101" in output.visible()
+            inspector_x = width - 3
+            key(f"\x1b[<65;{inspector_x};10M".encode())
+            key(b"\x1b")
+        click("Commands")
+        key(b"save capture\r")
+        until(lambda: scalar(store, "SELECT count(*) FROM snapshots") == 1, "Palette capture failed")
+        until(lambda: "Saved capture #1" in output.visible(), "Capture acknowledgement missing")
+        key(b"5")
+        until(lambda: "Manual TUI capture" in output.visible(), "Captures not loaded")
+        # A queued async open followed immediately by a mouse view change must
+        # never leave the user in the capture's Overview after the click.
+        key(b"\r\x0bgo to statements\r")
+        view("Statements")
+        pump(0.3)
+        view("Statements")
+        key(b"q")
+
+    options = ["--demo", "--refresh", "60", "--theme", "terminal" if no_mouse else "dark"]
+    if no_mouse:
+        options.append("--no-mouse")
+    terminal(store, options, actions, size=size)
+
+
 with tempfile.TemporaryDirectory(prefix="pgtrail-terminal-check-") as directory:
     folder = Path(directory)
-    for size in ((120, 36), (80, 24)):
+    for size in ((120, 36), (80, 24), (160, 48)):
         exercise(folder / f"history-{size[0]}x{size[1]}.sqlite3", size)
+    for size in ((80, 24), (160, 48)):
+        mouse_controls(folder / f"mouse-{size[0]}.sqlite3", size)
+    mouse_controls(folder / "keyboard.sqlite3", (80, 24), no_mouse=True)
     interrupt_recording(folder / "recorder.sqlite3")
-print(json.dumps({"result": "passed", "sizes": ["120x36", "80x24"], "checks": ["ten views, full details and section navigation", "finding evidence and return", "scrollable help and long captured SQL", "incident chronology, note and attached capture", "Markdown/JSON export and overwrite protection", "offline compare and restart", "filter/editor shortcuts", "resize and terminal restoration", "Ctrl+C during stalled PostgreSQL", "Ctrl+C during blocked SQLite recording"]}))
+print(json.dumps({"result": "passed", "sizes": ["80x24", "120x36", "160x48"], "checks": ["ten views, full details and section navigation", "finding evidence and return", "scrollable help and long captured SQL", "incident chronology, note and attached capture", "Markdown/JSON export and overwrite protection", "offline compare and restart", "filter/editor shortcuts", "command palette and pointer actions", "mouse clicks at 99/100/139/140 columns", "dark and terminal themes, --no-mouse", "resize, mouse and terminal restoration", "Ctrl+C during stalled PostgreSQL", "Ctrl+C during blocked SQLite recording"]}))

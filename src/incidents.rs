@@ -27,13 +27,13 @@ pub(crate) fn timeline(incident: &Incident) -> Vec<TimelineEntry> {
             at: capture.captured_at,
             title: format!("Capture #{}: {}", capture.id, capture.label),
             detail: format!(
-                "Capture #{}: {}\nObserved: {}\nSource: {}\nCollection: {}\n{}\nEnter: inspect this capture offline. Esc returns to this chronology.",
+                "Capture #{}: {}\nObserved: {}\nSource: {}\nCollection: {}\n{}\nEsc: return to the chronology, then Enter to inspect this capture offline.",
                 capture.id,
                 capture.label,
                 capture.captured_at.to_rfc3339(),
                 capture.source,
                 if capture.complete { "complete (not a health verdict)" } else { "partial; inspect coverage in the capture" },
-                incident.capture_notes.get(&capture.id).map(|note| format!("Annotation: {note}")).unwrap_or_default(),
+                incident.capture_notes.get(&capture.id).map(|note| format!("Annotation: {note}")).unwrap_or_else(|| "No capture annotation.".into()),
             ),
             capture_id: Some(capture.id),
         })
