@@ -63,7 +63,7 @@ fn export_review_frames() -> anyhow::Result<()> {
                 text: "Investigating the oldest blocking transaction".into(),
             }],
             captures: app.history.clone(),
-            capture_notes: Default::default(),
+            capture_notes: [(1, "Captured before adjusting the pool.\nThe oldest transaction still blocks checkout writes.".into())].into_iter().collect(),
         });
         for (name, tab) in [
             ("overview", Tab::Overview),
@@ -82,6 +82,10 @@ fn export_review_frames() -> anyhow::Result<()> {
         }
         app.incident_timeline = true;
         write_frame(&directory, "chronology", &mut app)?;
+        app.incident_cursor = 1;
+        app.execute(CommandId::CaptureDetails);
+        write_frame(&directory, "capture-details", &mut app)?;
+        app.report = None;
         app.tab = Tab::History;
         app.set_report(comparison);
         app.comparison = Some(crate::app::ComparisonContext {

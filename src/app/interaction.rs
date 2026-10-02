@@ -64,6 +64,7 @@ pub(crate) enum CommandId {
     ToggleIncident,
     ClearIncident,
     Timeline,
+    CaptureDetails,
     Help,
     Quit,
     Theme,
@@ -233,6 +234,21 @@ impl App {
             commands.push(Command::new(Sort, format!("Sort: {sort}"), "s", report));
         }
         if self.tab == Tab::Incidents {
+            if self.incident_timeline {
+                let capture = self.incident.as_ref().and_then(|incident| {
+                    crate::incidents::timeline(incident)
+                        .get(self.incident_cursor)
+                        .and_then(|entry| entry.capture_id)
+                });
+                commands.push(Command::new(
+                    CaptureDetails,
+                    "Capture details",
+                    "a",
+                    report.or(capture
+                        .is_none()
+                        .then_some("Select a capture in the chronology")),
+                ));
+            }
             let selected = if self.incident_timeline {
                 self.incident.as_ref().map(|i| &i.summary)
             } else if self.incidents_error.is_some() {
@@ -412,6 +428,20 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 self.open_report(ReportKind::Status, "Status details", message);
+                return None;
+            }
+            CaptureDetails => {
+                if self.tab == Tab::Incidents
+                    && self.incident_timeline
+                    && let Some(entry) = self.incident.as_ref().and_then(|incident| {
+                        crate::incidents::timeline(incident)
+                            .into_iter()
+                            .nth(self.incident_cursor)
+                            .filter(|entry| entry.capture_id.is_some())
+                    })
+                {
+                    self.open_report(ReportKind::Note, "Capture details", entry.detail);
+                }
                 return None;
             }
             Inspect if self.report.is_some() && self.report_kind == ReportKind::Selection => {

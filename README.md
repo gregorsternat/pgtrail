@@ -154,6 +154,7 @@ The default dark theme uses a slate background and cyan highlights. Use
 | `i` | Create an incident |
 | `n` | Add a note to the active incident |
 | `Enter` in Incidents | Open the complete chronology and activate an open incident; in the chronology, inspect a capture or the full note |
+| `a` in incident chronology | Read the selected capture's metadata and full annotation; annotated captures are marked in the list |
 | `t` in Incidents | Switch between incident list and chronology |
 | `e` / `E` in Incidents | Export Markdown / JSON to a destination entered in the prompt; existing files are never overwritten |
 | `o` in Incidents | Close or reopen the selected incident |

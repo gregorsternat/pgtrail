@@ -136,6 +136,115 @@ fn attached_capture_opens_and_returns_to_exact_timeline_selection() {
 }
 
 #[test]
+fn capture_annotation_is_readable_from_keyboard_palette_and_mouse() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for (width, height) in [(80, 24), (120, 36), (160, 48)] {
+        for input in ["keyboard", "palette", "mouse"] {
+            let mut app = app();
+            app.viewport_width = width;
+            app.viewport_height = height;
+            app.incident.as_mut().unwrap().capture_notes.insert(
+                1,
+                format!("{} ANNOTATION_END", "Contexte échec 東京\n".repeat(100)),
+            );
+            key(&mut app, KeyCode::Down);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(screen.contains("annotated"));
+            assert!(screen.contains("a Capture details"));
+            match input {
+                "keyboard" => {
+                    key(&mut app, KeyCode::Char('a'));
+                }
+                "palette" => {
+                    app.execute(CommandId::Commands);
+                    for c in "capture details".chars() {
+                        key(&mut app, KeyCode::Char(c));
+                    }
+                    assert_eq!(app.palette_commands().len(), 1);
+                    key(&mut app, KeyCode::Enter);
+                }
+                _ => {
+                    let control =
+                        crate::ui::controls(&app, &crate::ui::layout::Screen::for_app(&app))
+                            .into_iter()
+                            .find(|c| c.command.id == CommandId::CaptureDetails)
+                            .unwrap();
+                    app.update(Message::MouseClick {
+                        column: control.area.x,
+                        row: control.area.y,
+                    });
+                }
+            }
+            assert_eq!(app.report_title, "Capture details");
+            assert!(
+                app.report
+                    .as_ref()
+                    .unwrap()
+                    .contains("Annotation: Contexte échec 東京")
+            );
+            key(&mut app, KeyCode::End);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(
+                screen.contains("ANNOTATION_END"),
+                "annotation tail missing via {input} at {width}x{height}"
+            );
+            key(&mut app, KeyCode::Esc);
+            assert!(app.report.is_none());
+            assert!(app.incident_timeline);
+            assert_eq!(selected_id(&app), TimelineId::Capture(1));
+            assert_eq!(key(&mut app, KeyCode::Enter), Some(Action::Load(1)));
+        }
+    }
+}
+
+#[test]
+fn capture_details_distinguish_missing_annotation_and_operator_notes() {
+    let mut app = app();
+    let command = app
+        .commands()
+        .into_iter()
+        .find(|c| c.id == CommandId::CaptureDetails)
+        .unwrap();
+    assert_eq!(command.disabled, Some("Select a capture in the chronology"));
+    key(&mut app, KeyCode::Char('a'));
+    assert!(app.report.is_none());
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char('a'));
+    assert!(
+        app.report
+            .as_ref()
+            .unwrap()
+            .contains("No capture annotation.")
+    );
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Esc);
+    assert!(
+        !app.commands()
+            .iter()
+            .any(|c| c.id == CommandId::CaptureDetails)
+    );
+}
+
+#[test]
 fn export_destination_editor_preserves_quit_characters_and_selected_target() {
     let mut app = app();
     for (shortcut, json, destination) in [

@@ -773,7 +773,18 @@ fn incident_timeline(frame: &mut Frame, area: Rect, app: &App, incident: &crate:
         entries.iter().map(|entry| {
             Row::new(vec![
                 entry.at.format("%m-%d %H:%M:%S").to_string(),
-                clean(&entry.title),
+                clean(&format!(
+                    "{}{}",
+                    entry.title,
+                    if entry
+                        .capture_id
+                        .is_some_and(|id| incident.capture_notes.contains_key(&id))
+                    {
+                        " · annotated"
+                    } else {
+                        ""
+                    }
+                )),
             ])
         }),
         [Constraint::Length(15), Constraint::Min(10)],

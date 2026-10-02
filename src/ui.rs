@@ -541,6 +541,7 @@ h                        Read provenance, collection coverage and interval readi
 a / b / d / l            Mark earlier / later / compare / edit label
 i                        Create and activate a local incident
 0 Incidents: Enter       Open the full chronology; activate if open
+a in chronology         Read capture metadata and full annotation
 n                        Add a note to the active incident
 I in Captures             Attach selected capture to active incident
 o / x in Incidents       Close or reopen / stop attaching new captures

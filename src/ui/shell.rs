@@ -506,7 +506,15 @@ pub(crate) fn controls(app: &App, screen: &Screen) -> Vec<Control> {
                 Tab::Statements | Tab::Relations => vec![Inspect, Mode, Sort, Filter],
                 Tab::History => vec![Inspect, Before, After, Compare, Filter],
                 Tab::Incidents => {
-                    vec![Inspect, NewIncident, Note, ExportMarkdown, Timeline, Filter]
+                    vec![
+                        Inspect,
+                        CaptureDetails,
+                        NewIncident,
+                        Note,
+                        ExportMarkdown,
+                        Timeline,
+                        Filter,
+                    ]
                 }
                 _ => vec![PreviousSection, NextSection, Refresh, Pause, Coverage],
             }

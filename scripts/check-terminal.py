@@ -244,6 +244,9 @@ def exercise(store, size):
         with sqlite3.connect(store) as connection:
             note = "Observed a blocked checkout " + "timeline evidence " * 200 + "END_OF_LONG_NOTE"
             connection.execute("UPDATE incident_notes SET text=? WHERE id=(SELECT min(id) FROM incident_notes)", (note,))
+        annotation = "Contexte échec 東京\n" * 100 + "END_OF_CAPTURE_ANNOTATION"
+        subprocess.run([BINARY, "--store", str(store), "annotate", "6", "--note", annotation],
+                       env=environment(), check=True, capture_output=True)
         key(b"0")
         key(b"\r")
         until(lambda: b"chronology" in output.lower(), "Incident chronology missing")
@@ -254,6 +257,12 @@ def exercise(store, size):
         until(lambda: "END_OF_LONG_NOTE" in output.visible(), "End of long incident note is unreachable")
         key(b"\x1b")
         key(b"G")
+        until(lambda: "annotated" in output.visible(), "Capture annotation indicator missing")
+        key(b"a")
+        until(lambda: "Capture details" in output.visible(), "Capture details action missing")
+        key(b"G")
+        until(lambda: "END_OF_CAPTURE_ANNOTATION" in output.visible(), "Full capture annotation is unreachable")
+        key(b"\x1b")
         key(b"\r")
         until(lambda: b"OFFLINE CAPTURE" in output, "Timeline capture did not open")
         key(b"\x1b")
@@ -263,6 +272,7 @@ def exercise(store, size):
         key(b"\r")
         until(markdown.exists, "Markdown export was not written")
         assert "Chronology note 6" in markdown.read_text()
+        assert "END_OF_CAPTURE_ANNOTATION" in markdown.read_text().replace("\\_", "_")
         assert markdown.stat().st_mode & 0o777 == 0o600, "Export is not private"
         key(b"E" + str(json_export).encode())
         key(b"\r")
