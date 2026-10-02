@@ -142,7 +142,13 @@ fn apply_input(
     generation: &mut u64,
     message: event::Message,
 ) -> Option<Action> {
-    if matches!(message, event::Message::Key(_) | event::Message::Mouse(_)) {
+    if matches!(
+        message,
+        event::Message::Key(_)
+            | event::Message::MouseClick { .. }
+            | event::Message::ScrollUp { .. }
+            | event::Message::ScrollDown { .. }
+    ) {
         *generation = generation.wrapping_add(1);
     }
     app.update(message)
@@ -175,7 +181,10 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
     let collector = collector(cli).await?;
     let path = cli.store_path()?;
     let mut app = app::App::new(cli.demo);
-    app.theme = cli.theme;
+    app.theme = match cli.theme {
+        crate::cli::ThemeChoice::Dark => ui::Theme::Dark,
+        crate::cli::ThemeChoice::Terminal => ui::Theme::Terminal,
+    };
     app.mouse_enabled = !cli.no_mouse;
     app.connection_configured = collector.is_some() || cli.demo;
     if let Some(id) = cli.incident {
@@ -426,9 +435,7 @@ mod tests {
 
     #[test]
     fn late_capture_load_cannot_override_mouse_or_palette_navigation() {
-        use crossterm::event::{
-            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         for pointer in [true, false] {
             let mut app = app::App::new(true);
             app.viewport_width = 120;
@@ -446,12 +453,10 @@ mod tests {
                 apply_input(
                     &mut app,
                     &mut generation,
-                    event::Message::Mouse(MouseEvent {
-                        kind: MouseEventKind::Down(MouseButton::Left),
+                    event::Message::MouseClick {
                         column: rect.x,
                         row: rect.y,
-                        modifiers: KeyModifiers::NONE,
-                    }),
+                    },
                 );
             } else {
                 app.overlay = app::Overlay::Commands {

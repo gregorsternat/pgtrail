@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use futures_util::StreamExt;
 
@@ -9,7 +9,9 @@ pub(crate) enum Message {
     Quit,
     Redraw,
     Key(KeyEvent),
-    Mouse(MouseEvent),
+    MouseClick { column: u16, row: u16 },
+    ScrollUp { column: u16, row: u16 },
+    ScrollDown { column: u16, row: u16 },
 }
 
 pub(crate) async fn next(events: &mut EventStream) -> Result<Message> {
@@ -40,14 +42,23 @@ fn translate(event: Event) -> Option<Message> {
             }
         }
         Event::Resize(_, _) => Some(Message::Redraw),
-        Event::Mouse(event)
-            if matches!(
-                event.kind,
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            ) =>
-        {
-            Some(Message::Mouse(event))
-        }
+        Event::Mouse(event) => match event.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                Some(Message::MouseClick {
+                    column: event.column,
+                    row: event.row,
+                })
+            }
+            MouseEventKind::ScrollUp => Some(Message::ScrollUp {
+                column: event.column,
+                row: event.row,
+            }),
+            MouseEventKind::ScrollDown => Some(Message::ScrollDown {
+                column: event.column,
+                row: event.row,
+            }),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -55,6 +66,7 @@ fn translate(event: Event) -> Option<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::MouseEvent;
 
     #[test]
     fn control_c_always_quits_but_plain_characters_reach_the_editor() {
@@ -85,27 +97,32 @@ mod tests {
     }
 
     #[test]
-    fn mouse_clicks_and_wheels_are_messages_but_motion_and_release_are_ignored() {
+    fn left_clicks_and_wheels_are_messages_but_other_mouse_input_is_ignored() {
         use crossterm::event::MouseButton;
+        let event = |kind| MouseEvent {
+            kind,
+            column: 4,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            translate(Event::Mouse(event(MouseEventKind::Down(MouseButton::Left)))),
+            Some(Message::MouseClick { column: 4, row: 8 })
+        );
+        assert_eq!(
+            translate(Event::Mouse(event(MouseEventKind::ScrollUp))),
+            Some(Message::ScrollUp { column: 4, row: 8 })
+        );
+        assert_eq!(
+            translate(Event::Mouse(event(MouseEventKind::ScrollDown))),
+            Some(Message::ScrollDown { column: 4, row: 8 })
+        );
         for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::ScrollDown,
-            MouseEventKind::ScrollUp,
+            MouseEventKind::Down(MouseButton::Right),
             MouseEventKind::Moved,
             MouseEventKind::Up(MouseButton::Left),
         ] {
-            let event = MouseEvent {
-                kind,
-                column: 4,
-                row: 8,
-                modifiers: KeyModifiers::NONE,
-            };
-            let expected = if matches!(kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
-                None
-            } else {
-                Some(Message::Mouse(event))
-            };
-            assert_eq!(translate(Event::Mouse(event)), expected);
+            assert_eq!(translate(Event::Mouse(event(kind))), None);
         }
     }
 }

@@ -1,6 +1,6 @@
 use super::layout::Screen;
 use super::*;
-use crate::app::{Command, CommandId, Focus, NAVIGATION, Overlay, ReportKind};
+use crate::app::{Command, CommandId, ControlAction, Focus, NAVIGATION, Overlay, ReportKind};
 
 pub(crate) struct Control {
     pub(crate) area: Rect,
@@ -10,7 +10,7 @@ pub(crate) struct Control {
 
 pub(crate) struct KeyControl {
     pub(crate) area: Rect,
-    pub(crate) key: crossterm::event::KeyCode,
+    pub(crate) action: ControlAction,
     label: &'static str,
 }
 
@@ -20,7 +20,6 @@ pub(crate) fn prompt_area(app: &App) -> Rect {
 
 pub(crate) fn editor_controls(app: &App) -> Vec<KeyControl> {
     use crate::app::PromptKind;
-    use crossterm::event::KeyCode;
     let (area, label) = if let Some(prompt) = &app.prompt {
         let popup = prompt_area(app);
         (
@@ -51,22 +50,25 @@ pub(crate) fn editor_controls(app: &App) -> Vec<KeyControl> {
         return Vec::new();
     };
     let mut x = area.x;
-    [(KeyCode::Enter, label), (KeyCode::Esc, "Esc Cancel")]
-        .into_iter()
-        .filter_map(|(key, label)| {
-            let width = label.len() as u16 + 2;
-            if x + width > area.right() {
-                return None;
-            }
-            let control = KeyControl {
-                area: Rect::new(x, area.y, width, 1),
-                key,
-                label,
-            };
-            x += width + 1;
-            Some(control)
-        })
-        .collect()
+    [
+        (ControlAction::Submit, label),
+        (ControlAction::Cancel, "Esc Cancel"),
+    ]
+    .into_iter()
+    .filter_map(|(action, label)| {
+        let width = label.len() as u16 + 2;
+        if x + width > area.right() {
+            return None;
+        }
+        let control = KeyControl {
+            area: Rect::new(x, area.y, width, 1),
+            action,
+            label,
+        };
+        x += width + 1;
+        Some(control)
+    })
+    .collect()
 }
 
 pub(super) fn render_editor_controls(frame: &mut Frame, app: &App) {
@@ -85,13 +87,12 @@ fn render_key_controls(frame: &mut Frame, controls: Vec<KeyControl>) {
 }
 
 pub(crate) fn overlay_controls(app: &App, area: Rect) -> Vec<KeyControl> {
-    use crossterm::event::KeyCode;
     let mut controls = Vec::new();
     let mut right = area.right().saturating_sub(1);
-    for (key, label) in [
-        (KeyCode::Esc, "Esc Close"),
+    for (action, label) in [
+        (ControlAction::Cancel, "Esc Close"),
         (
-            KeyCode::Char('a'),
+            ControlAction::ToggleHelpReference,
             if app.help_all {
                 "a Context"
             } else {
@@ -99,7 +100,7 @@ pub(crate) fn overlay_controls(app: &App, area: Rect) -> Vec<KeyControl> {
             },
         ),
     ] {
-        if key != KeyCode::Esc && !app.help {
+        if action != ControlAction::Cancel && !app.help {
             continue;
         }
         let width = label.len() as u16 + 2;
@@ -109,7 +110,7 @@ pub(crate) fn overlay_controls(app: &App, area: Rect) -> Vec<KeyControl> {
         right -= width;
         controls.push(KeyControl {
             area: Rect::new(right, area.y, width, 1),
-            key,
+            action,
             label,
         });
         right = right.saturating_sub(1);

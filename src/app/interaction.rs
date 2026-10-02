@@ -1,5 +1,5 @@
 //! Keyboard, pointer and command palette share the same action dispatch.
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 
 use super::{Action, App, Tab};
@@ -71,6 +71,13 @@ pub(crate) enum CommandId {
     Close,
     PreviousSection,
     NextSection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlAction {
+    Submit,
+    Cancel,
+    ToggleHelpReference,
 }
 
 #[derive(Debug, Clone)]
@@ -649,24 +656,24 @@ impl App {
         self.focus = Focus::Content;
     }
 
-    pub(super) fn mouse(&mut self, event: MouseEvent) -> Option<Action> {
+    pub(super) fn mouse(
+        &mut self,
+        column: u16,
+        row: u16,
+        click: bool,
+        movement: isize,
+    ) -> Option<Action> {
         if !self.mouse_enabled || self.viewport_width < 24 || self.viewport_height < 8 {
             return None;
         }
-        let point = Position::new(event.column, event.row);
-        let click = event.kind == MouseEventKind::Down(MouseButton::Left);
-        let movement = match event.kind {
-            MouseEventKind::ScrollDown => 3,
-            MouseEventKind::ScrollUp => -3,
-            _ => 0,
-        };
+        let point = Position::new(column, row);
         if self.prompt.is_some() || self.editing_filter {
             if click
                 && let Some(control) = ui::editor_controls(self)
                     .iter()
                     .find(|c| c.area.contains(point))
             {
-                return self.domain_key(KeyEvent::new(control.key, KeyModifiers::NONE));
+                return self.activate_control(control.action, true);
             }
             return None;
         }
@@ -678,7 +685,7 @@ impl App {
                         .iter()
                         .find(|c| c.area.contains(point))
                 {
-                    return self.key(KeyEvent::new(control.key, KeyModifiers::NONE));
+                    return self.activate_control(control.action, false);
                 }
                 if movement != 0 {
                     self.help_scroll = self.help_scroll.saturating_add_signed(movement);
@@ -798,6 +805,20 @@ impl App {
         }
         None
     }
+
+    fn activate_control(&mut self, action: ControlAction, in_editor: bool) -> Option<Action> {
+        let code = match action {
+            ControlAction::Submit => KeyCode::Enter,
+            ControlAction::Cancel => KeyCode::Esc,
+            ControlAction::ToggleHelpReference => KeyCode::Char('a'),
+        };
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        if in_editor {
+            self.domain_key(key)
+        } else {
+            self.key(key)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -816,12 +837,7 @@ mod tests {
         app.update(Message::Key(KeyEvent::new(code, KeyModifiers::NONE)))
     }
     fn click(app: &mut App, x: u16, y: u16) -> Option<Action> {
-        app.update(Message::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: x,
-            row: y,
-            modifiers: KeyModifiers::NONE,
-        }))
+        app.update(Message::MouseClick { column: x, row: y })
     }
 
     #[test]
@@ -1025,7 +1041,7 @@ mod tests {
         assert!(!app.should_quit());
         let save = ui::editor_controls(&app)
             .into_iter()
-            .find(|c| c.key == KeyCode::Enter)
+            .find(|c| c.action == ControlAction::Submit)
             .unwrap();
         assert_eq!(
             click(&mut app, save.area.x, save.area.y),
@@ -1038,7 +1054,7 @@ mod tests {
         key(&mut app, KeyCode::Char('q'));
         let cancel = ui::editor_controls(&app)
             .into_iter()
-            .find(|c| c.key == KeyCode::Esc)
+            .find(|c| c.action == ControlAction::Cancel)
             .unwrap();
         click(&mut app, cancel.area.x, cancel.area.y);
         assert!(!app.editing_filter);

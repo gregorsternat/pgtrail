@@ -2,7 +2,9 @@
 mod incident_tests;
 mod interaction;
 mod navigation;
-pub(crate) use interaction::{Command, CommandId, Focus, NAVIGATION, Overlay, ReportKind};
+pub(crate) use interaction::{
+    Command, CommandId, ControlAction, Focus, NAVIGATION, Overlay, ReportKind,
+};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -386,8 +388,13 @@ impl App {
 
     pub(crate) fn update(&mut self, message: Message) -> Option<Action> {
         self.now = Utc::now();
-        if matches!(message, Message::Key(_) | Message::Mouse(_))
-            && let Some(request) = self.pending_capture_request
+        if matches!(
+            message,
+            Message::Key(_)
+                | Message::MouseClick { .. }
+                | Message::ScrollUp { .. }
+                | Message::ScrollDown { .. }
+        ) && let Some(request) = self.pending_capture_request
         {
             self.discard_pending_capture_return(request);
         }
@@ -398,7 +405,9 @@ impl App {
             }
             Message::Redraw => None,
             Message::Key(key) => self.key(key),
-            Message::Mouse(event) => self.mouse(event),
+            Message::MouseClick { column, row } => self.mouse(column, row, true, 0),
+            Message::ScrollUp { column, row } => self.mouse(column, row, false, -3),
+            Message::ScrollDown { column, row } => self.mouse(column, row, false, 3),
         }
     }
 

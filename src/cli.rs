@@ -2,6 +2,13 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ThemeChoice {
+    #[default]
+    Dark,
+    Terminal,
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -10,8 +17,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 )]
 pub(crate) struct Cli {
     /// Color palette for the interactive terminal
-    #[arg(long, value_enum, default_value_t = crate::ui::Theme::Dark, global = true)]
-    pub(crate) theme: crate::ui::Theme,
+    #[arg(long, value_enum, default_value_t = ThemeChoice::Dark, global = true)]
+    pub(crate) theme: ThemeChoice,
     /// Leave mouse input to the terminal instead of the TUI
     #[arg(long, global = true)]
     pub(crate) no_mouse: bool,

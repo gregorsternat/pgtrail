@@ -1,5 +1,4 @@
 //! Widgets use a small semantic palette, resolved once at the frame boundary.
-use clap::ValueEnum;
 use ratatui::{Frame, style::Color};
 
 pub(super) const ACCENT: Color = Color::Cyan;
@@ -9,7 +8,7 @@ pub(super) const BORDER: Color = Color::Indexed(8);
 pub(super) const SURFACE: Color = Color::Black;
 pub(super) const SELECTED: Color = Color::Blue;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Theme {
     #[default]
     Dark,
