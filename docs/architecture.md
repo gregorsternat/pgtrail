@@ -64,9 +64,11 @@ I/O to the owning adapter or orchestration layer.
 
 The pure modules reject direct SQLx/Tokio access, standard filesystem/network/I/O,
 process/environment/thread access, terminal output macros, and adapter service
-imports. App state may use Crossterm event values; it may import only `Message`
-from the event adapter. Pure consumers may import specific incident/capture records
-from store, never `Store` or a wildcard. Test-only modules can use fixtures and I/O.
+imports. App state may use Crossterm keyboard values (`KeyCode`, `KeyEvent`, and
+`KeyModifiers`), but mouse input must reach it as translated `Message` variants.
+App state may import only `Message` from the event adapter. Pure consumers may
+import specific incident/capture records from store, never `Store` or a wildcard.
+Test-only modules can use fixtures and I/O.
 
 These are syntax guardrails, not call-graph analysis or a proof of purity. Expanded
 macro bodies, re-exported APIs, and indirect side effects still require review and

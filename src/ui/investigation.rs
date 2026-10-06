@@ -9,158 +9,120 @@ pub(super) fn overview(frame: &mut Frame, area: Rect, app: &App) {
         render_empty(
             frame,
             area,
-            " Investigation overview ",
-            "Waiting for an observation.\n\nConnect with --profile NAME or PGTRAIL_DATABASE_URL.\nUse --demo to explore synthetic data, or 5 to open local history.",
+            " Welcome to pgtrail ",
+            "No observation available yet.
+
+Connect with --profile NAME or PGTRAIL_DATABASE_URL.
+Explore synthetic data with --demo.
+
+Open Captures (5) or Incidents (0) to investigate saved evidence.",
         );
         return;
     };
     let Some(analysis) = &app.analysis else {
         return;
     };
-    let details_height = if area.height >= 17 {
-        10
-    } else if area.height >= 10 {
-        5
-    } else {
-        0
-    };
-    let [summary, list, details] = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Min(0),
-        Constraint::Length(details_height),
-    ])
-    .areas(area);
+    let [summary, list] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
     let activity = snapshot.activity.available().map_or_else(
         || "Activity unavailable".into(),
         |sessions| {
             format!(
-                "{} visible sessions · {} waiting on blockers",
+                "{} visible sessions  ·  {} blocked",
                 sessions.len(),
                 sessions.iter().filter(|s| !s.blockers.is_empty()).count()
             )
         },
     );
-    let limit = analysis
-        .coverage
-        .iter()
-        .skip(3)
-        .find(|line| !line.ends_with(": collected") && !line.starts_with("No finding"));
-    let lines = vec![
-        Line::raw(format!(
-            "{} · h: full coverage details",
-            if snapshot.is_synthetic() {
-                "SYNTHETIC demo"
-            } else {
-                "PostgreSQL observation"
-            }
-        ))
-        .fg(ACCENT)
-        .bold(),
-        Line::raw(crate::diagnostics::collection_summary(snapshot)),
-        Line::raw(limit.map_or_else(
-            || "Section and interval reasons are available with h.".into(),
-            |reason| format!("Limit: {}", clean(reason)),
-        ))
-        .fg(WARNING),
-        Line::raw(crate::diagnostics::interval_summary(&analysis.rates)),
-        Line::raw(format!("{activity} · {} findings", analysis.findings.len())),
-    ];
-    frame.render_widget(Paragraph::new(lines), summary);
+    let coverage = crate::diagnostics::collection_summary(snapshot)
+        .replace("; complete collection (not a health verdict)", "")
+        .replace("; incomplete collection", " · PARTIAL");
+    let ready = [
+        analysis.rates.database.available().is_some(),
+        analysis.rates.wal.available().is_some(),
+        analysis.rates.statements.available().is_some(),
+    ]
+    .into_iter()
+    .filter(|ready| *ready)
+    .count();
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(format!(
+                " {activity}  ·  {} findings",
+                analysis.findings.len()
+            ))
+            .bold(),
+            Line::raw(format!(
+                " {coverage} · Intervals {ready}/3 ready · h: coverage"
+            ))
+            .fg(MUTED),
+        ]),
+        summary,
+    );
     let findings = app.filtered_findings();
     if findings.is_empty() {
         render_empty(
             frame,
             list,
             " Findings ",
-            &if app.filter.is_empty() {
-                "No configured findings triggered in the available evidence.\nThis does not prove database health; review coverage and workload context.".into()
+            if app.filter.is_empty() {
+                "No configured findings triggered in the available evidence.
+This does not prove database health; review coverage with h."
             } else {
-                format!(
-                    "No findings match Overview filter {:?}. Press / to change it, or Esc to clear it.",
-                    clean(&app.filter)
-                )
+                "No findings match this filter. Press Esc to clear it."
             },
         );
-    } else {
-        let rows = findings.iter().map(|finding| {
-            Row::new(vec![
-                severity(finding.severity).0.to_owned(),
-                clean(&finding.title),
-            ])
-            .style(Style::new().fg(severity(finding.severity).1))
-        });
-        let table = Table::new(rows, [Constraint::Length(9), Constraint::Min(10)])
-            .header(table_header(vec!["Severity", "Investigation finding"]))
-            .block(panel(" Findings · Enter: full details "));
-        render_table(frame, list, table, app.selected());
+        return;
     }
-    if details_height > 0 {
-        let mut lines = Vec::new();
-        if let Some(finding) = findings.get(app.selected()) {
-            lines.push(Line::raw(clean(&finding.interpretation)));
-            lines.push(Line::raw("Evidence").fg(ACCENT).bold());
-            lines.extend(
-                finding
-                    .evidence
-                    .iter()
-                    .map(|e| Line::raw(format!("• {}", clean(e)))),
-            );
-            lines.push(Line::raw("Next steps").fg(ACCENT).bold());
-            lines.extend(
-                finding
-                    .next_steps
-                    .iter()
-                    .map(|step| Line::raw(format!("• {}", clean(step)))),
-            );
-        } else {
-            lines.push(Line::raw("Coverage and interpretation limits").fg(ACCENT));
-            lines.extend(
-                analysis
-                    .coverage
-                    .iter()
-                    .map(|reason| Line::raw(clean(reason))),
-            );
-        }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(panel(" Evidence · Enter expands all details "))
-                .wrap(Wrap { trim: false }),
-            details,
-        );
-    }
+    let rows = findings.iter().map(|finding| {
+        Row::new(vec![
+            ratatui::widgets::Cell::from(severity(finding.severity).0)
+                .style(Style::new().fg(severity(finding.severity).1)),
+            ratatui::widgets::Cell::from(clean(&finding.title)),
+        ])
+    });
+    let table = Table::new(rows, [Constraint::Length(9), Constraint::Min(10)])
+        .header(table_header(vec!["Severity", "Investigation finding"], &[]))
+        .block(content_panel(app, " Findings · ordered by severity "));
+    render_table(frame, list, table, app);
 }
 
 pub(super) fn database(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(snapshot) = observed(frame, area, app, " Database ") else {
-        return;
+    scroll(frame, area, app, " Database ");
+}
+
+fn database_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(snapshot) = app.snapshot() else {
+        return vec![Line::raw(
+            "No observation available yet. Open Captures (5) or connect with --profile NAME.",
+        )];
     };
     let mut lines = Vec::new();
     heading(&mut lines, "CURRENT DATABASE AND CLUSTER CAPACITY");
     match &snapshot.health.database {
         Observation::Unavailable(reason) => unavailable(&mut lines, "Database", reason),
         Observation::Available(db) => {
-            lines.push(Line::raw(format!(
-                "Database size {} · connections {} in this database",
-                bytes(db.size_bytes as f64),
-                db.num_backends
-            )));
-            lines.push(Line::raw(format!(
-                "Cluster client connections {} / {} max · {} reserved",
-                db.cluster_backends, db.max_connections, db.reserved_connections
-            )));
-            lines.push(Line::raw(format!(
-                "Autovacuum {} · track_counts {} · I/O timing {} · database XID age {}",
-                on(db.autovacuum),
-                on(db.track_counts),
-                on(db.track_io_timing),
-                db.frozen_xid_age
-            )));
-            lines.push(Line::raw(format!(
-                "Database counter reset: {}",
-                timestamp(db.stats_reset)
-            )));
+            field_grid(
+                &mut lines,
+                width,
+                vec![
+                    ("Database size", bytes(db.size_bytes as f64)),
+                    ("Database connections", db.num_backends.to_string()),
+                    (
+                        "Cluster clients",
+                        format!("{} / {} max", db.cluster_backends, db.max_connections),
+                    ),
+                    ("Reserved connections", db.reserved_connections.to_string()),
+                    ("Autovacuum", on(db.autovacuum).into()),
+                    ("Track counts", on(db.track_counts).into()),
+                    ("I/O timing", on(db.track_io_timing).into()),
+                    ("Database XID age", db.frozen_xid_age.to_string()),
+                ],
+            );
+            lines
+                .push(Line::raw(format!("Counter reset: {}", timestamp(db.stats_reset))).fg(MUTED));
         }
     }
+
     heading(
         &mut lines,
         "INTERVAL RATES · PREVIOUS TO CURRENT OBSERVATION",
@@ -177,7 +139,7 @@ pub(super) fn database(frame: &mut Frame, area: Rect, app: &App) {
             Observation::Unavailable(reason) => unavailable(&mut lines, "Rates", reason),
             Observation::Available(rates) => {
                 lines.push(Line::raw(clean(&rates.baseline)).fg(MUTED));
-                for (label, metric, unit) in [
+                let fields = [
                     ("Transactions", &rates.transactions_per_second, "/s"),
                     ("Commits", &rates.commits_per_second, "/s"),
                     ("Rollbacks", &rates.rollbacks_per_second, "/s"),
@@ -192,12 +154,11 @@ pub(super) fn database(frame: &mut Frame, area: Rect, app: &App) {
                     ("Rows deleted", &rates.deleted_per_second, "/s"),
                     ("Block read time", &rates.read_ms_per_second, " ms/s"),
                     ("Block write time", &rates.write_ms_per_second, " ms/s"),
-                ] {
-                    lines.push(Line::raw(format!(
-                        "{label}: {}",
-                        metric_with_reason(metric, unit)
-                    )));
-                }
+                ]
+                .into_iter()
+                .map(|(label, metric, unit)| (label, metric_with_reason(metric, unit)))
+                .collect();
+                field_grid(&mut lines, width, fields);
             }
         }
     }
@@ -210,7 +171,7 @@ pub(super) fn database(frame: &mut Frame, area: Rect, app: &App) {
             Line::raw("Live trends are hidden while inspecting an offline capture.").fg(MUTED),
         );
     } else {
-        let width = usize::from(area.width.saturating_sub(24));
+        let width = usize::from(width.saturating_sub(24));
         for (label, values) in [
             (
                 "Transactions/s",
@@ -254,21 +215,25 @@ pub(super) fn database(frame: &mut Frame, area: Rect, app: &App) {
         "CUMULATIVE DATABASE COUNTERS · SINCE THEIR RESET",
     );
     if let Observation::Available(db) = &snapshot.health.database {
-        lines.push(Line::raw(format!(
-            "Commits {} · rollbacks {} · deadlocks {} · recovery conflicts {}",
-            db.xact_commit, db.xact_rollback, db.deadlocks, db.conflicts
-        )));
-        lines.push(Line::raw(format!(
-            "Temporary files {} · written {} · shared reads {} · hits {}",
-            db.temp_files,
-            bytes(db.temp_bytes as f64),
-            db.blks_read,
-            db.blks_hit
-        )));
-        lines.push(Line::raw(format!(
-            "Tuples returned {} · fetched {} · inserted {} · updated {} · deleted {}",
-            db.tup_returned, db.tup_fetched, db.tup_inserted, db.tup_updated, db.tup_deleted
-        )));
+        field_grid(
+            &mut lines,
+            width,
+            vec![
+                ("Commits", db.xact_commit.to_string()),
+                ("Rollbacks", db.xact_rollback.to_string()),
+                ("Deadlocks", db.deadlocks.to_string()),
+                ("Recovery conflicts", db.conflicts.to_string()),
+                ("Temporary files", db.temp_files.to_string()),
+                ("Temporary writes", bytes(db.temp_bytes as f64)),
+                ("Shared reads", db.blks_read.to_string()),
+                ("Shared hits", db.blks_hit.to_string()),
+                ("Tuples returned", db.tup_returned.to_string()),
+                ("Tuples fetched", db.tup_fetched.to_string()),
+                ("Tuples inserted", db.tup_inserted.to_string()),
+                ("Tuples updated", db.tup_updated.to_string()),
+                ("Tuples deleted", db.tup_deleted.to_string()),
+            ],
+        );
     }
     lines.push(
         Line::raw(
@@ -276,7 +241,7 @@ pub(super) fn database(frame: &mut Frame, area: Rect, app: &App) {
         )
         .fg(MUTED),
     );
-    scroll(frame, area, app, " Database · j/k: scroll ", lines);
+    lines
 }
 
 pub(super) fn relations(frame: &mut Frame, area: Rect, app: &App) {
@@ -285,90 +250,94 @@ pub(super) fn relations(frame: &mut Frame, area: Rect, app: &App) {
     };
     let stats = match &snapshot.health.tables {
         Observation::Unavailable(reason) => {
-            render_empty(frame, area, " Relations unavailable ", &clean(reason));
+            render_empty(
+                frame,
+                area,
+                " Relations unavailable ",
+                &format!(
+                    "{}\n\nPress r to retry collection or h to inspect coverage.",
+                    clean(reason)
+                ),
+            );
             return;
         }
         Observation::Available(stats) => stats,
     };
-    let detail_height = if area.height >= 13 { 8 } else { 0 };
-    let [table_area, details] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(detail_height)]).areas(area);
     let limited = if stats.truncated {
         " · LIMITED coverage"
     } else {
         ""
     };
-    let mut detail_lines = Vec::new();
     if app.show_indexes {
         let indexes = app.filtered_indexes();
-        let sort = ["size ↓", "invalid first", "scans ↓"][app.relation_sort.min(2)];
+        if indexes.is_empty() {
+            render_empty(
+                frame,
+                area,
+                " Indexes ",
+                if app.filter.is_empty() {
+                    "No indexes were returned in this observation. Press v to inspect tables or r to refresh."
+                } else {
+                    "No indexes match this filter. Press Esc to clear it or v to inspect tables."
+                },
+            );
+            return;
+        }
         let rows = indexes.iter().map(|i| {
-            Row::new(vec![
-                format!("{}.{}", clean(&i.schema), clean(&i.name)),
-                bytes(i.size_bytes as f64),
-                i.scans.to_string(),
-                if i.valid {
-                    "valid".into()
-                } else {
-                    "INVALID".into()
-                },
-                if i.primary {
-                    "primary".into()
-                } else if i.unique {
-                    "unique".into()
-                } else {
-                    "ordinary".into()
-                },
-            ])
+            data_row(
+                vec![
+                    format!("{}.{}", clean(&i.schema), clean(&i.name)),
+                    bytes(i.size_bytes as f64),
+                    i.scans.to_string(),
+                    if i.valid { "valid" } else { "INVALID" }.into(),
+                    if i.primary {
+                        "primary"
+                    } else if i.unique {
+                        "unique"
+                    } else {
+                        "ordinary"
+                    }
+                    .into(),
+                ],
+                &[1, 2],
+            )
             .style(Style::new().fg(if i.valid { Color::Reset } else { WARNING }))
         });
         let table = Table::new(
             rows,
             [
-                Constraint::Min(20),
-                Constraint::Length(12),
-                Constraint::Length(12),
+                Constraint::Min(18),
+                Constraint::Length(10),
+                Constraint::Length(10),
                 Constraint::Length(9),
                 Constraint::Length(10),
             ],
         )
-        .header(table_header(vec![
-            "Index",
-            "Size",
-            "Scans",
-            "Validity",
-            "Constraint",
-        ]))
-        .block(panel(format!(
-            " Indexes · sort: {sort} (s) · v: tables{limited} "
-        )));
-        render_table(frame, table_area, table, app.selected());
-        if let Some(i) = indexes.get(app.selected()) {
-            detail_lines.push(Line::raw(format!(
-                "{}.{} on {} · index OID {} · table OID {}",
-                clean(&i.schema),
-                clean(&i.name),
-                clean(&i.table),
-                i.oid,
-                i.table_oid
-            )));
-            detail_lines.push(Line::raw(format!(
-                "Scans {} · index tuples read {} · heap tuples fetched {}",
-                i.scans, i.tuples_read, i.tuples_fetched
-            )));
-            detail_lines.push(Line::raw("Scan counts are cumulative and can reset; low usage alone does not justify removal.").fg(MUTED));
-            detail_lines.push(Line::raw("Check constraints, workload coverage and query plans before changing an index.").fg(MUTED));
-        } else {
-            detail_lines.push(Line::raw(format!(
-                "No indexes match Relations filter {:?}.",
-                clean(&app.filter)
-            )));
-        }
+        .header(table_header(
+            vec!["Index", "Size", "Scans", "Validity", "Constraint"],
+            &[1, 2],
+        ))
+        .block(content_panel(
+            app,
+            format!(" Indexes · cumulative scans{limited} "),
+        ));
+        render_table(frame, area, table, app);
     } else {
         let tables = app.filtered_tables();
-        let wide = area.width >= 100;
-        let sort =
-            ["size ↓", "estimated dead tuples ↓", "sequential scans ↓"][app.relation_sort.min(2)];
+        if tables.is_empty() {
+            render_empty(
+                frame,
+                area,
+                " Tables ",
+                if app.filter.is_empty() {
+                    "No tables were returned in this observation. Press v to inspect indexes or r to refresh."
+                } else {
+                    "No tables match this filter. Press Esc to clear it."
+                },
+            );
+            return;
+        }
+        let wide = area.width >= 95;
         let rows = tables.iter().map(|t| {
             let mut cells = vec![
                 format!("{}.{}", clean(&t.schema), clean(&t.name)),
@@ -380,7 +349,7 @@ pub(super) fn relations(frame: &mut Frame, area: Rect, app: &App) {
             if wide {
                 cells.push(optional_integer(t.idx_scan));
             }
-            Row::new(cells)
+            data_row(cells, &[1, 2, 3, 4, 5])
         });
         let mut widths = vec![
             Constraint::Min(18),
@@ -391,74 +360,34 @@ pub(super) fn relations(frame: &mut Frame, area: Rect, app: &App) {
         ];
         let mut headers = vec!["Table", "Total size", "Est. live", "Est. dead", "Seq scans"];
         if wide {
-            widths.push(Constraint::Length(12));
+            widths.push(Constraint::Length(10));
             headers.push("Idx scans");
         }
         let table = Table::new(rows, widths)
-            .header(table_header(headers))
-            .block(panel(format!(
-                " Tables · sort: {sort} (s) · v: indexes{limited} "
-            )));
-        render_table(frame, table_area, table, app.selected());
-        if let Some(t) = tables.get(app.selected()) {
-            detail_lines.push(Line::raw(format!(
-                "{}.{} · OID {} · table {} · indexes {} · XID age {}",
-                clean(&t.schema),
-                clean(&t.name),
-                t.oid,
-                bytes(t.table_bytes as f64),
-                bytes(t.index_bytes as f64),
-                t.frozen_xid_age
-            )));
-            detail_lines.push(Line::raw(format!(
-                "Modifications since analyze (est.) {} · scans seq {} / index {}",
-                t.modified_since_analyze,
-                t.seq_scan,
-                optional_integer(t.idx_scan)
-            )));
-            detail_lines.push(Line::raw(format!(
-                "Vacuum {} · autovacuum {} (UTC)",
-                maintenance_time(t.last_vacuum),
-                maintenance_time(t.last_autovacuum)
-            )));
-            detail_lines.push(Line::raw(format!(
-                "Analyze {} · autoanalyze {} (UTC)",
-                maintenance_time(t.last_analyze),
-                maintenance_time(t.last_autoanalyze)
-            )));
-            detail_lines.push(
-                Line::raw("Tuples are estimates, not measured bloat. Scans are cumulative.")
-                    .fg(MUTED),
-            );
-            detail_lines.push(
-                Line::raw("— = no timestamp recorded; maintenance may have run before reset.")
-                    .fg(MUTED),
-            );
-        } else {
-            detail_lines.push(Line::raw(format!(
-                "No tables match Relations filter {:?}.",
-                clean(&app.filter)
-            )));
-        }
-    }
-    if detail_height > 0 {
-        frame.render_widget(
-            Paragraph::new(detail_lines)
-                .block(panel(" Selected relation · Enter: full details "))
-                .wrap(Wrap { trim: false }),
-            details,
-        );
+            .header(table_header(headers, &[1, 2, 3, 4, 5]))
+            .block(content_panel(
+                app,
+                format!(" Tables · tuple counts are estimates{limited} "),
+            ));
+        render_table(frame, area, table, app);
     }
 }
 
 pub(super) fn replication(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(snapshot) = observed(frame, area, app, " Replication ") else {
-        return;
+    scroll(frame, area, app, " Replication ");
+}
+
+fn replication_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(snapshot) = app.snapshot() else {
+        return vec![Line::raw(
+            "No observation available yet. Open Captures (5) or connect with --profile NAME.",
+        )];
     };
     let stats = match &snapshot.health.replication {
         Observation::Unavailable(reason) => {
-            render_empty(frame, area, " Replication unavailable ", &clean(reason));
-            return;
+            return vec![
+                Line::raw(format!("Replication unavailable: {}", clean(reason))).fg(WARNING),
+            ];
         }
         Observation::Available(stats) => stats,
     };
@@ -498,11 +427,20 @@ pub(super) fn replication(frame: &mut Frame, area: Rect, app: &App) {
             ))
             .fg(ACCENT),
         );
-        lines.push(Line::raw(format!(
-            "  Sent-to-replay backlog {} · reported replay lag {}",
-            optional_bytes(sender.sent_replay_lag_bytes),
-            optional_float(sender.replay_lag_ms, " ms")
-        )));
+        field_grid(
+            &mut lines,
+            width,
+            vec![
+                (
+                    "Sent-to-replay backlog",
+                    optional_bytes(sender.sent_replay_lag_bytes),
+                ),
+                (
+                    "Reported replay lag",
+                    optional_float(sender.replay_lag_ms, " ms"),
+                ),
+            ],
+        );
         lines.push(
             Line::raw(
                 "  Lag may be NULL on idle or disconnected senders; it is not catch-up time.",
@@ -525,21 +463,30 @@ pub(super) fn replication(frame: &mut Frame, area: Rect, app: &App) {
             ))
             .fg(if slot.active { ACCENT } else { WARNING }),
         );
-        lines.push(Line::raw(format!(
-            "  Retained WAL {} · WAL status {} · safe WAL headroom {}",
-            optional_bytes(slot.retained_bytes),
-            value(slot.wal_status.as_deref()),
-            optional_bytes(slot.safe_wal_size)
-        )));
+        field_grid(
+            &mut lines,
+            width,
+            vec![
+                ("Retained WAL", optional_bytes(slot.retained_bytes)),
+                ("WAL status", value(slot.wal_status.as_deref())),
+                ("Safe WAL headroom", optional_bytes(slot.safe_wal_size)),
+            ],
+        );
         lines.push(Line::raw("  NULL headroom can mean unlimited retention or an unusable slot; inspect WAL status.").fg(MUTED));
     }
     lines.push(Line::raw("Retention is a potential disk-pressure signal. pgtrail never drops slots or changes replication.").fg(MUTED));
-    scroll(frame, area, app, " Replication · j/k: scroll ", lines);
+    lines
 }
 
 pub(super) fn io(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(snapshot) = observed(frame, area, app, " I/O and maintenance ") else {
-        return;
+    scroll(frame, area, app, " I/O, WAL and maintenance ");
+}
+
+fn io_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(snapshot) = app.snapshot() else {
+        return vec![Line::raw(
+            "No observation available yet. Open Captures (5) or connect with --profile NAME.",
+        )];
     };
     let mut lines = Vec::new();
     heading(&mut lines, "WAL GENERATION · CLUSTER SCOPE");
@@ -593,16 +540,19 @@ pub(super) fn io(frame: &mut Frame, area: Rect, app: &App) {
                     ))
                     .fg(ACCENT),
                 );
-                lines.push(Line::raw(format!(
-                    "  Reads {} / {} · writes {} / {} · hits {} · evictions {} · fsyncs {}",
-                    optional_integer(row.reads),
-                    optional_float(row.read_time_ms, " ms"),
-                    optional_integer(row.writes),
-                    optional_float(row.write_time_ms, " ms"),
-                    optional_integer(row.hits),
-                    optional_integer(row.evictions),
-                    optional_integer(row.fsyncs)
-                )));
+                field_grid(
+                    &mut lines,
+                    width,
+                    vec![
+                        ("Reads", optional_integer(row.reads)),
+                        ("Read time", optional_float(row.read_time_ms, " ms")),
+                        ("Writes", optional_integer(row.writes)),
+                        ("Write time", optional_float(row.write_time_ms, " ms")),
+                        ("Hits", optional_integer(row.hits)),
+                        ("Evictions", optional_integer(row.evictions)),
+                        ("Fsyncs", optional_integer(row.fsyncs)),
+                    ],
+                );
             }
         }
     }
@@ -646,13 +596,7 @@ pub(super) fn io(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    scroll(
-        frame,
-        area,
-        app,
-        " I/O, WAL and maintenance · j/k: scroll ",
-        lines,
-    );
+    lines
 }
 
 pub(super) fn statement_rates(frame: &mut Frame, area: Rect, app: &App) {
@@ -671,7 +615,7 @@ pub(super) fn statement_rates(frame: &mut Frame, area: Rect, app: &App) {
             area,
             " Statement intervals unavailable ",
             &format!(
-                "{}\n\nTwo compatible observations and unchanged statistics epochs are required.\nPress v for cumulative statistics. Offline interval reports are available through History A/B comparison.",
+                "{}\n\nTwo compatible observations and unchanged statistics epochs are required.\nPress v for cumulative statistics. Offline interval reports are available through Captures before/after comparison.",
                 clean(reason)
             ),
         );
@@ -683,16 +627,15 @@ pub(super) fn statement_rates(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             area,
             " Statement intervals ",
-            &format!(
-                "No statements match Statements filter {:?} in this interval. Press / to change it, Esc to clear it, or v for cumulative statistics.",
-                clean(&app.filter)
-            ),
+            if app.filter.is_empty() {
+                "No shared statement entries were available in this interval. Press v for cumulative statistics or r for another observation."
+            } else {
+                "No statements match this filter in this interval. Press Esc to clear it or v for cumulative statistics."
+            },
         );
         return;
     }
-    let details_height = if area.height >= 13 { 8 } else { 0 };
-    let [table_area, details] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(details_height)]).areas(area);
+    let table_area = area;
     let wide = area.width >= 100;
     let rows = rates.iter().map(|r| {
         let mut cells = vec![
@@ -705,13 +648,13 @@ pub(super) fn statement_rates(frame: &mut Frame, area: Rect, app: &App) {
         if wide {
             cells.push(metric(&r.shared_reads_per_second));
         }
-        Row::new(cells)
+        data_row(cells, &[0, 1, 2, 3, 4, 5])
     });
     let mut widths = vec![
         Constraint::Min(18),
         Constraint::Length(8),
         Constraint::Length(10),
-        Constraint::Length(11),
+        Constraint::Length(12),
         Constraint::Length(13),
     ];
     let mut headers = vec![
@@ -726,41 +669,16 @@ pub(super) fn statement_rates(frame: &mut Frame, area: Rect, app: &App) {
         headers.push("Reads/s");
     }
     let table = Table::new(rows, widths)
-        .header(table_header(headers))
-        .block(panel(format!(
-            " Statements · interval {:.2}s · sort: {} (s) · v: cumulative ",
-            analysis.rates.elapsed_seconds.unwrap_or_default(),
-            app.sort.title()
-        )));
-    render_table(frame, table_area, table, app.selected());
-    if let Some(rate) = rates.get(app.selected()) {
-        let mut lines = vec![Line::raw(format!(
-            "User {} · database {} · query {} · top-level {}",
-            rate.identity.userid, rate.identity.dbid, rate.identity.queryid, rate.identity.toplevel
-        ))];
-        for (label, observation, unit) in [
-            ("Calls", &rate.calls_per_second, "/s"),
-            ("Execution", &rate.exec_ms_per_second, " ms/s"),
-            ("Mean completed execution", &rate.mean_exec_ms, " ms"),
-            ("Shared reads", &rate.shared_reads_per_second, " blocks/s"),
-            (
-                "Temporary writes",
-                &rate.temp_blocks_per_second,
-                " blocks/s",
+        .header(table_header(headers, &[0, 1, 2, 3, 4, 5]))
+        .block(content_panel(
+            app,
+            format!(
+                " Statements · interval {:.2}s · sort: {} (s) · v: cumulative ",
+                analysis.rates.elapsed_seconds.unwrap_or_default(),
+                app.sort.title()
             ),
-        ] {
-            lines.push(Line::raw(format!(
-                "{label}: {}",
-                metric_with_reason(observation, unit)
-            )));
-        }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(panel(" Interval details · Enter: full details "))
-                .wrap(Wrap { trim: false }),
-            details,
-        );
-    }
+        ));
+    render_table(frame, table_area, table, app);
 }
 
 pub(super) fn incidents(frame: &mut Frame, area: Rect, app: &App) {
@@ -768,6 +686,18 @@ pub(super) fn incidents(frame: &mut Frame, area: Rect, app: &App) {
         && let Some(incident) = &app.incident
     {
         incident_timeline(frame, area, app, incident);
+        return;
+    }
+    if let Some(error) = &app.incidents_error {
+        render_empty(
+            frame,
+            area,
+            " Incidents unavailable ",
+            &format!(
+                "{}\n\nPress r to reload the local incident list.",
+                clean(error)
+            ),
+        );
         return;
     }
     let incidents = app.filtered_incidents();
@@ -783,25 +713,27 @@ pub(super) fn incidents(frame: &mut Frame, area: Rect, app: &App) {
         render_empty(frame, area, " Local incidents ", &message);
         return;
     }
-    let [table_area, details] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(5)]).areas(area);
+    let table_area = area;
     let rows = incidents.iter().map(|incident| {
-        Row::new(vec![
-            if app.active_incident == Some(incident.id) {
-                "*".into()
-            } else {
-                String::new()
-            },
-            incident.id.to_string(),
-            clean(&incident.title),
-            if incident.closed_at.is_some() {
-                "closed".into()
-            } else {
-                "open".into()
-            },
-            incident.capture_count.to_string(),
-            incident.note_count.to_string(),
-        ])
+        data_row(
+            vec![
+                if app.active_incident == Some(incident.id) {
+                    "*".into()
+                } else {
+                    String::new()
+                },
+                incident.id.to_string(),
+                clean(&incident.title),
+                if incident.closed_at.is_some() {
+                    "closed".into()
+                } else {
+                    "open".into()
+                },
+                incident.capture_count.to_string(),
+                incident.note_count.to_string(),
+            ],
+            &[1, 4, 5],
+        )
     });
     let table = Table::new(
         rows,
@@ -814,46 +746,20 @@ pub(super) fn incidents(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(5),
         ],
     )
-    .header(table_header(vec![
-        "", "ID", "Incident", "State", "Captures", "Notes",
-    ]))
-    .block(panel(
+    .header(table_header(
+        vec!["", "ID", "Incident", "State", "Captures", "Notes"],
+        &[1, 4, 5],
+    ))
+    .block(content_panel(
+        app,
         " Incidents · * active destination · Enter: timeline ",
     ));
-    render_table(frame, table_area, table, app.selected());
-    render_empty(
-        frame,
-        details,
-        " Incident actions ",
-        "Enter: full chronology · e: export Markdown · E: export JSON\ni: create · n: add note · o: close/reopen · x: clear destination\nOpen incidents become the destination for new captures. Exports require a new file path.",
-    );
+    render_table(frame, table_area, table, app);
 }
 
 fn incident_timeline(frame: &mut Frame, area: Rect, app: &App, incident: &crate::store::Incident) {
     let entries = crate::incidents::timeline(incident);
-    let [header, table_area, details] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(4),
-        Constraint::Length(6),
-    ])
-    .areas(area);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::raw(format!(
-                "#{}: {} · {}",
-                incident.summary.id,
-                clean(&incident.summary.title),
-                if incident.summary.closed_at.is_some() {
-                    "closed"
-                } else {
-                    "open"
-                }
-            )),
-            Line::raw("Enter: open capture / full note · e: Markdown · E: JSON"),
-            Line::raw("↑/↓ PgUp/PgDn Home/End: timeline · t/Esc: incident list"),
-        ]),
-        header,
-    );
+    let table_area = area;
     if entries.is_empty() {
         render_empty(
             frame,
@@ -867,50 +773,44 @@ fn incident_timeline(frame: &mut Frame, area: Rect, app: &App, incident: &crate:
         entries.iter().map(|entry| {
             Row::new(vec![
                 entry.at.format("%m-%d %H:%M:%S").to_string(),
-                clean(&entry.title),
+                clean(&format!(
+                    "{}{}",
+                    entry.title,
+                    if entry
+                        .capture_id
+                        .is_some_and(|id| incident.capture_notes.contains_key(&id))
+                    {
+                        " · annotated"
+                    } else {
+                        ""
+                    }
+                )),
             ])
         }),
         [Constraint::Length(15), Constraint::Min(10)],
     )
-    .header(table_header(vec!["Time (UTC)", "Evidence / note"]))
-    .block(panel(format!(
-        " Full chronology · {}/{} ",
-        app.incident_cursor + 1,
-        entries.len()
-    )));
-    render_table(frame, table_area, table, app.incident_cursor);
-    if let Some(entry) = entries.get(app.incident_cursor) {
-        frame.render_widget(
-            Paragraph::new(
-                entry
-                    .detail
-                    .lines()
-                    .map(|line| Line::raw(clean(line)))
-                    .collect::<Vec<_>>(),
-            )
-            .block(panel(if entry.capture_id.is_some() {
-                " Selected capture · Enter: inspect "
+    .header(table_header(vec!["Time (UTC)", "Evidence / note"], &[]))
+    .block(content_panel(
+        app,
+        format!(
+            " Full chronology · #{}: {} · {} ",
+            incident.summary.id,
+            clean(&incident.summary.title),
+            if incident.summary.closed_at.is_some() {
+                "closed"
             } else {
-                " Selected note · Enter: full scrollable text "
-            }))
-            .wrap(Wrap { trim: false }),
-            details,
-        );
-    }
+                "open"
+            }
+        ),
+    ));
+    render_table(frame, table_area, table, app);
 }
 
-pub(super) fn prompt(frame: &mut Frame, area: Rect, app: &App) {
+pub(super) fn prompt(frame: &mut Frame, app: &App) {
     let Some(prompt) = &app.prompt else {
         return;
     };
-    let width = area.width.saturating_sub(2).min(100);
-    let height = area.height.saturating_sub(2).min(9);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
+    let popup = super::shell::prompt_area(app);
     let title = match prompt.kind {
         PromptKind::Incident => " New incident ".into(),
         PromptKind::Note(id) => format!(" Note for incident #{id} "),
@@ -920,33 +820,35 @@ pub(super) fn prompt(frame: &mut Frame, area: Rect, app: &App) {
             if json { "JSON" } else { "Markdown" }
         ),
     };
-    let max_visible =
-        usize::from(width.saturating_sub(4)) * usize::from(height.saturating_sub(4)).max(1);
-    let count = prompt.value.chars().count();
-    let value: String = prompt
-        .value
-        .chars()
-        .skip(count.saturating_sub(max_visible))
-        .collect();
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::raw(format!(
-                "{}{}▏",
-                if count > max_visible { "…" } else { "" },
-                clean(&value)
-            )),
-            Line::raw(""),
-            Line::raw("Enter: save · Esc: cancel · Ctrl+U: clear · Backspace: erase").fg(MUTED),
-        ])
-        .block(
-            Block::bordered()
-                .title(title)
-                .border_style(Style::new().fg(ACCENT)),
-        )
-        .wrap(Wrap { trim: false }),
-        popup,
+    frame.render_widget(panel(title).border_style(Style::new().fg(ACCENT)), popup);
+    let text_area = Rect::new(
+        popup.x + 2,
+        popup.y + 1,
+        popup.width.saturating_sub(4),
+        popup.height.saturating_sub(4),
     );
+    let rows = report_lines(&format!("{}▏", clean(&prompt.value)), text_area.width);
+    let offset = rows.len().saturating_sub(text_area.height as usize);
+    frame.render_widget(
+        Paragraph::new(
+            rows.into_iter()
+                .skip(offset)
+                .map(Line::raw)
+                .collect::<Vec<_>>(),
+        ),
+        text_area,
+    );
+    frame.render_widget(
+        Paragraph::new("Ctrl+U: clear · Backspace: erase").fg(MUTED),
+        Rect::new(
+            text_area.x,
+            popup.bottom().saturating_sub(3),
+            text_area.width,
+            1,
+        ),
+    );
+    super::shell::render_editor_controls(frame, app);
 }
 
 fn observed<'a>(frame: &mut Frame, area: Rect, app: &'a App, title: &str) -> Option<&'a Snapshot> {
@@ -955,10 +857,44 @@ fn observed<'a>(frame: &mut Frame, area: Rect, app: &'a App, title: &str) -> Opt
             frame,
             area,
             title,
-            "No observation available yet. Connect live or inspect a saved capture from History (5).",
+            "No observation available yet. Connect live or inspect a saved capture from Captures (5).",
         );
     }
     app.snapshot()
+}
+
+fn field_grid(lines: &mut Vec<Line<'static>>, width: u16, fields: Vec<(&str, String)>) {
+    let column_width = usize::from(width.saturating_sub(4)) / 2;
+    let mut pending: Vec<Span<'static>> = Vec::new();
+    for (label, value) in fields {
+        let text = format!("{label}: {value}");
+        let fits = width >= 72 && Span::raw(&text).width() + 2 <= column_width;
+        if !fits {
+            if !pending.is_empty() {
+                lines.push(Line::from(std::mem::take(&mut pending)));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label}: "), Style::new().fg(MUTED)),
+                Span::raw(value),
+            ]));
+            continue;
+        }
+        let padding =
+            column_width.saturating_sub(Span::raw(label).width() + Span::raw(&value).width() + 1);
+        pending.push(Span::styled(
+            format!("{label}:{}", " ".repeat(padding)),
+            Style::new().fg(MUTED),
+        ));
+        pending.push(Span::raw(value));
+        if pending.len() == 2 {
+            pending.push(Span::raw("    "));
+        } else {
+            lines.push(Line::from(std::mem::take(&mut pending)));
+        }
+    }
+    if !pending.is_empty() {
+        lines.push(Line::from(pending));
+    }
 }
 
 fn heading(lines: &mut Vec<Line<'static>>, title: &str) {
@@ -972,13 +908,45 @@ fn unavailable(lines: &mut Vec<Line<'static>>, label: &str, reason: &str) {
     lines.push(Line::raw(format!("{label} unavailable: {}", clean(reason))).fg(WARNING));
 }
 
-fn scroll(frame: &mut Frame, area: Rect, app: &App, title: &str, lines: Vec<Line<'static>>) {
-    // Step through logical lines so all metrics stay reachable when text wraps.
-    let offset = app.selected().min(lines.len().saturating_sub(1));
+pub(crate) fn metric_rows(app: &App, width: u16) -> Vec<Line<'static>> {
+    let lines = match app.tab {
+        Tab::Database => database_lines(app, width),
+        Tab::Replication => replication_lines(app, width),
+        Tab::Io => io_lines(app, width),
+        _ => return Vec::new(),
+    };
+    lines
+        .into_iter()
+        .flat_map(|line| super::wrap_styled_line(line, width))
+        .collect()
+}
+
+fn scroll(frame: &mut Frame, area: Rect, app: &App, title: &str) {
+    let rows = metric_rows(app, area.width.saturating_sub(2));
+    let visible = usize::from(area.height.saturating_sub(2));
+    let offset = app.selected().min(rows.len().saturating_sub(visible));
+    let position = format!(
+        " {}–{} / {} · [ / ] sections ",
+        offset + usize::from(!rows.is_empty()),
+        (offset + visible).min(rows.len()),
+        rows.len()
+    );
     frame.render_widget(
-        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>())
-            .block(panel(title.to_owned()))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(
+            rows.into_iter()
+                .skip(offset)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        )
+        .block(
+            content_panel(app, title.to_owned())
+                .title_bottom(position)
+                .border_style(Style::new().fg(if app.focus == crate::app::Focus::Content {
+                    ACCENT
+                } else {
+                    BORDER
+                })),
+        ),
         area,
     );
 }
@@ -999,9 +967,6 @@ fn timestamp(value: Option<DateTime<Utc>>) -> String {
         || "unavailable / never recorded".into(),
         |at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
     )
-}
-fn maintenance_time(value: Option<DateTime<Utc>>) -> String {
-    value.map_or_else(|| "—".into(), |at| at.format("%Y-%m-%d %H:%M").to_string())
 }
 fn optional_integer(value: Option<i64>) -> String {
     value.map_or_else(|| "—".into(), |v| v.to_string())
